@@ -1136,7 +1136,10 @@ static Status launch(PyObject* dispatcher_pyobj, Grid grid, CUstream launch_stre
 
     {
         CUresult res = g_cuStreamGetCtx(launch_stream, &helper->cuda_context);
-        if (res != CUDA_SUCCESS) {
+        // INVALID_CONTEXT can happen when it is NULL stream and there is
+        // no active context in current thread. We will still get the context
+        // from the array arguments later during `extract_cuda_args`.
+        if (res != CUDA_SUCCESS && res != CUDA_ERROR_INVALID_CONTEXT) {
             return raise(PyExc_RuntimeError, "Failed to get a CUDA context from a stream: %s",
                          get_cuda_error(res));
         }
