@@ -225,13 +225,13 @@ def test_scalar_abs(shape, tile, is_constant, dtype, tmp_path):
     assert_equal(y, abs(x))
 
 
-@pytest.mark.parametrize("invert_func", ['~', 'ct.invert'])
+@pytest.mark.parametrize("bitwise_not_func", ['~', 'ct.bitwise_not'])
 @pytest.mark.parametrize("dtype", int_dtypes + bool_dtypes, ids=dtype_id)
-def test_array_bit_invert(shape, tile, dtype, tmp_path, invert_func):
+def test_array_bitwise_not(shape, tile, dtype, tmp_path, bitwise_not_func):
     x = make_tensor(shape, dtype=dtype, device='cuda')
     y = torch.zeros_like(x, device="cuda")
-    kernel = array_kernel('bit_invert',
-                          "ty = ~tx" if invert_func == "~" else f"ty = {invert_func}(tx)",
+    kernel = array_kernel('bitwise_not',
+                          "ty = ~tx" if bitwise_not_func == "~" else f"ty = {bitwise_not_func}(tx)",
                           tmp_path)
     launch_unary(kernel, x, y, tile)
     assert_equal(y, ~x)
@@ -239,13 +239,13 @@ def test_array_bit_invert(shape, tile, dtype, tmp_path, invert_func):
 
 @pytest.mark.parametrize("is_constant", [False, True])
 @pytest.mark.parametrize("dtype", int_dtypes, ids=dtype_id)
-def test_scalar_bit_invert(shape, tile, is_constant, dtype, tmp_path):
+def test_scalar_bitwise_not(shape, tile, is_constant, dtype, tmp_path):
     x = 5
     y = torch.zeros(shape, dtype=torch.int32, device='cuda')
     if not is_constant:
-        kernel = scalar_kernel('bit_invert', 'c = ~x', tmp_path)
+        kernel = scalar_kernel('bitwise_not', 'c = ~x', tmp_path)
     else:
-        kernel = const_scalar_kernel('bit_invert', "int", 'c = ~x', tmp_path)
+        kernel = const_scalar_kernel('bitwise_not', "int", 'c = ~x', tmp_path)
     launch_unary(kernel, x, y, tile)
     assert_equal(y, ~x)
 

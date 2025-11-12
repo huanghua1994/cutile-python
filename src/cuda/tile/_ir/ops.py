@@ -1383,7 +1383,7 @@ class UnaryOpOperation(Operation):
 @impl(ct.cos, fixed_args=["cos"])
 @impl(ct.cosh, fixed_args=["cosh"])
 @impl(ct.exp, fixed_args=["exp"])
-@impl(ct.invert, fixed_args=["invert"])
+@impl(ct.bitwise_not, fixed_args=["invert"])
 @impl(ct.floor, fixed_args=["floor"])
 @impl(ct.ceil, fixed_args=["ceil"])
 @impl(ct.negative, fixed_args=["neg"])

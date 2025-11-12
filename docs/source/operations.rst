@@ -138,7 +138,7 @@ Bitwise
    bitwise_xor
    bitwise_lshift
    bitwise_rshift
-   invert
+   bitwise_not
 
 
 Comparison

@@ -1443,8 +1443,8 @@ def bitwise_rshift(x, y, /) -> TileOrScalar:
 
 
 @function
-def invert(x, /) -> TileOrScalar:
-    """Elementwise bitwise inversion on a tile or scalar
+def bitwise_not(x, /) -> TileOrScalar:
+    """Elementwise bitwise not on a tile or scalar
 
     Can also use builtin operator `~x`.
 
@@ -1457,7 +1457,7 @@ def invert(x, /) -> TileOrScalar:
     Examples:
 
         >>> tx = ct.full((4, 4), 0, dtype=np.int32)
-        >>> ty = ct.invert(x)
+        >>> ty = ct.bitwise_not(x)
         >>> ty = ~tx
     """
 
