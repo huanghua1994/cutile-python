@@ -8,7 +8,7 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from types import FunctionType
-from typing import Tuple, Any, Optional, Sequence
+from typing import Tuple, Any, Optional, Sequence, Callable
 
 from cuda.tile._debug import CUDA_TILE_LOGS
 from cuda.tile._exception import (
@@ -49,8 +49,6 @@ class TypingContext:
     def __init__(self, ir_ctx: IRContext) -> None:
         self.ir_ctx = ir_ctx
         self.phis = defaultdict(PhiState)
-        self.call_stack = []
-        self.call_ends = set()
 
     @property
     def typemap(self):
@@ -91,14 +89,6 @@ class TypingContext:
 
     def set_type(self, var: Var, typ: Type) -> None:
         self.typemap[var.name] = typ
-
-    def enter_function(self, pyfunc, last_op: Operation):
-        self.call_ends.add(last_op)
-        self.call_stack.append(pyfunc)
-
-    def leave_function(self, last_op: Operation):
-        self.call_ends.remove(last_op)
-        self.call_stack.pop()
 
     def phi_propagate_constant(self, src: Var, dst: Var):
         phi = self.phis[dst.name]
@@ -248,6 +238,13 @@ def _bind_args(sig_func, args, kwargs, block, loc, ctx) -> Sequence[Var]:
     return ret
 
 
+def _check_recursive_call(call_loc: Loc, callee: Callable):
+    while call_loc is not None:
+        if call_loc.function is callee:
+            raise TileTypeError("Recursive function call detected")
+        call_loc = call_loc.call_site
+
+
 def _replace_call(block: Block, idx: int, ctx: TypingContext):
     from cuda.tile._ir.ops import GetBoundSelf, assign, typed_const
 
@@ -300,8 +297,7 @@ def _replace_call(block: Block, idx: int, ctx: TypingContext):
     else:
         # Callee is a user-defined function.
         from cuda.tile._ast2ir import get_function_ir
-        if callee in ctx.call_stack:
-            raise TileTypeError("Recursive function call detected")
+        _check_recursive_call(op.loc, callee)
 
         sig = get_signature(callee)
         for param_name, param in sig.parameters.items():
@@ -314,7 +310,6 @@ def _replace_call(block: Block, idx: int, ctx: TypingContext):
             assign(arg, new_block, op.loc, param)
         new_block.extend(callee_function_ir.root_block.detach_all())
         assign(callee_function_ir.return_value, new_block, op.loc, op.result_var)
-        ctx.enter_function(callee, new_block[-1])
 
     block[idx:idx+1] = new_block.detach_all()
 
@@ -367,8 +362,6 @@ def infer_types_in_block(context: TypingContext, block: Block) -> None:
 
         with op.loc:
             try:
-                if op in context.call_ends:
-                    context.leave_function(op)
                 i += infer_types_for_op(context, block, i)
             except TileError:
                 raise
@@ -392,7 +385,6 @@ def infer_types_in_func(context: TypingContext, func: Function, args: Tuple[Argu
 
 def infer_types_pass(func: Function, args: Tuple[Argument, ...], pyfunc: FunctionType):
     context = TypingContext(func.root_block.ctx)
-    context.enter_function(pyfunc, func.root_block[-1])
     try:
         infer_types_in_func(context, func, args)
     except Exception as e:
