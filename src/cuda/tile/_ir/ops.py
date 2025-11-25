@@ -3229,8 +3229,9 @@ class TileArange(TypedOperation):
 
 
 def arange(size: int, dtype: DType) -> Var:
-    res_ty = make_tile_ty(dtype, (size,))
-    return add_operation(TileArange, res_ty)
+    res_ty = make_tile_ty(datatype.default_int_type, (size,))
+    res = add_operation(TileArange, res_ty)
+    return astype(res, dtype)
 
 
 @impl(ct.arange)

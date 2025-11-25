@@ -394,13 +394,13 @@ type) an underlying type hint.
 
 @function
 def bid(axis) -> int:
-    """Get the index of current block
+    """Gets the index of current block.
 
     Args:
-        axis (int): The axis of the block index space. Possible values are 0, 1, 2.
+        axis (const int): The axis of the block index space. Possible values are 0, 1, 2.
 
     Returns:
-        int:
+        int32:
 
     Examples:
 
@@ -412,13 +412,13 @@ def bid(axis) -> int:
 
 @function
 def num_blocks(axis) -> int:
-    """Get the number of blocks along the axis
+    """Gets the number of blocks along the axis.
 
     Args:
-        axis (int): The axis of the block index space. Possible values are 0, 1, 2.
+        axis (const int): The axis of the block index space. Possible values are 0, 1, 2.
 
     Returns:
-        int:
+        int32:
 
     Examples:
 
@@ -433,13 +433,13 @@ def num_tiles(array: Array, /,
               axis: int,
               shape: Constant[Shape],
               order: Constant[Order] = "C") -> int:
-    """Get number of tiles in array along the axis
+    """Gets the number of tiles in the |tile space| of the array along the `axis`.
 
     Args:
-        array (ArrayLike): An array object on a cuda device
-        axis (int): The axis of the tile partition space to get the dim size
-        shape (Shape): The shape of the tile.
-        order ("C" or "F", or tuple[int, ...]): Order of axis mapping. See :py:func:`load`.
+        array (Array): An array object on a cuda device.
+        axis (const int): The axis of the tile partition space to get the dim size.
+        shape (const int...): A sequence of const integers definining the shape of the tile.
+        order ("C" or "F", or tuple[const int,...]): Order of axis mapping. See :py:func:`load`.
 
     Examples:
 
@@ -454,36 +454,60 @@ def num_tiles(array: Array, /,
 
 
 @function
-def load(array: Array, /, index: Shape, shape: Constant[Shape], *,
-         order: Constant[Order] = "C", padding_mode: PaddingMode = PaddingMode.UNDETERMINED,
-         latency: Optional[int] = None, allow_tma: Optional[bool] = None) -> Tile:
-    """Produces the |tile| at ``index`` in the |tile space| of ``shape`` from |array| ``array``.
+def load(array: Array, /,
+         index: Shape,
+         shape: Constant[Shape], *,
+         order: Constant[Order] = "C",
+         padding_mode: PaddingMode = PaddingMode.UNDETERMINED,
+         latency: Optional[int] = None,
+         allow_tma: Optional[bool] = None) -> Tile:
+    """Loads a tile from the `array` which is partitioned into a |tile space|.
 
-    Returns a |tile| that contains a copy of the following elements of the |array|::
+    The |tile space| is the result of partitioning the `array` into a grid of equally
+    sized tiles specified by `shape`.
 
-        array[tuple(slice(index[x]*shape[x], (index[x]+1)*shape[x]) for x in order)]
+    For example, partitoning a 2D `array` of shape ``(M, N)`` using tile shape
+    ``(tm, tn)`` results in a 2D tile space of size ``(cdiv(M, tm), cdiv(N, tn))``.
+    An index into this tile space using index ``(i, j)`` produces a tile of size ``(tm, tn)``:
+
+        >>> t = ct.load(array, (i, j), (tm, tn))  # `t` has shape (tm, tn)
+
+    The result tile `t` will be computed according to ::
+
+        t[x, y] = array[i * tm + x, j * tn + y]  (for all 0<=x<tm, 0<=y<tn)
+
+    For access that is out of bound, the value will be determined by `padding_mode`.
+
+    `order` is used to map the tile axis to the array axis. The transposed example of the above call
+    to `load` would be:
+
+        >>> ct.load(array, (j, i), shape=(tn, tm), order=(1, 0))
+
+    The result tile `t` will be computed according to ::
+
+        t[y, x] = array[i * tm + x, j * tn + y]
+
+
 
     Args:
         array (Array): The |array| to load from.
-        index (Shape): An index in the |tile space| of ``shape`` from ``array``.
-        shape (Shape): The shape of the tile.
-        order: Permutation applied to array axes before the logical |tile space| is constructed.
-            Can be specified either as a tuple of integer constants, or as one of the two special
-            string literal values:
+        index (tuple[int,...]): An index in the |tile space| of ``shape`` from ``array``.
+        shape (tuple[const int,...]): A tuple of const integers definining the shape of the tile.
+        order ("C" or "F", or tuple[const int,...]): Permutation applied to array axes before the
+            logical |tile space| is constructed. Can be specified either as a tuple of constants,
+            or as one of the two special string literal values:
 
             * "C" is an alias for ``(0, 1, 2, ...)``, i.e. no permutation applied;
             * "F" is an alias for ``(..., 2, 1, 0)``, i.e. axis order is reversed.
 
-            Default: "C".
         padding_mode (PaddingMode): The value used to pad the tile when it extends beyond the array
-            boundaries. This occurs when the array dimensions are not divisible by the tile size.
-            Default: PaddingMode.UNDETERMINED - the padding value is undetermined.
-        latency (int, optional): A hint indicating how heavy DRAM traffic will be. It shall be an
-            integer between 1 (low) and 10 (high).
-            If it is None or not provided, the compiler will infer the latency.
-            Default: None.
-        allow_tma (bool, optional): If True, the load may be lowered to TMA.
-            Default: ?.
+            boundaries. By default, the padding value is undetermined.
+        latency (const int): A hint indicating how heavy DRAM traffic will be. It shall be an
+            integer between 1 (low) and 10 (high). By default, the compiler will infer the latency.
+        allow_tma (const bool): If False, the load will not use TMA. By default, TMA is allowed.
+
+    Returns:
+        Tile:
 
     Examples:
 
@@ -504,27 +528,38 @@ def load(array: Array, /, index: Shape, shape: Constant[Shape], *,
 
 
 @function
-def store(array: Array, /, index: Shape, tile: TileOrScalar, order: Constant[Order] = "C",
-          latency: Optional[int] = None, allow_tma: Optional[bool] = None) -> None:
-    """Assigns ``tile`` to ``index`` in the |tile space| of ``tile.shape`` in |array| ``array``.
+def store(array: Array, /,
+          index: Shape,
+          tile: TileOrScalar, *,
+          order: Constant[Order] = "C",
+          latency: Optional[int] = None,
+          allow_tma: Optional[bool] = None) -> None:
+    """Stores a `tile` value into the `array` at the `index` of its |tile space|.
 
-    Copies ``tile``'s elements to the |array|::
+    The |tile space| is the result of partitioning the `array` into a grid of tiles
+    with equal size defined by the shape of the `tile`.
 
-        array[tuple(slice(index[x]*tile.shape[x], (index[x]+1)*tile.shape[x])
-                    for x in order)] = tile
+    For example, given a tile `t` of shape ``(tm, tn)`` and array of shape ``(M, N)``:
+
+        >>> # tile `t` has shape (tm, tn)
+        >>> ct.store(array, (i, j), t)
+
+    The above call to `store` will store elements according to::
+
+        array[i * tm + x, i * tn + y] = t[x, y]  (for 0<=x<tm, 0<=y<tn)
+
+    Access which falls out of the boundary of the `array` will be ignored.
 
     Args:
         array (Array): The |array| to store to.
-        index (Shape): An index in the |tile space| of ``shape`` from ``array``.
-        tile (TileOrScalar): The |tile| to store. The rank of the tile must match rank of the array,
+        index (tuple[int,...]): An index in the |tile space| of ``array``.
+            ``shape`` is inferred from the ``tile`` argument.
+        tile (Tile): The |tile| to store. The rank of the tile must match rank of the array,
             unless it is a scalar or 0d tile.
-        order (Order): Order of axis mapping. See :py:func:`load`.
+        order ("C" or "F", or tuple[const int,...]): Order of axis mapping. See :py:func:`load`.
         latency (int, optional): A hint indicating how heavy DRAM traffic will be. It shall be an
-            integer between 1 (low) and 10 (high).
-            If it is None or not provided, the compiler will infer the latency.
-            Default: None.
-        allow_tma (bool, optional): If True, the load may be lowered to TMA.
-            Default: ?.
+            integer between 1 (low) and 10 (high). By default, the compiler will infer the latency.
+        allow_tma (bool, optional): If False, the load will not use TMA. By default, TMA is allowed.
 
     Examples:
 
@@ -544,7 +579,7 @@ def store(array: Array, /, index: Shape, tile: TileOrScalar, order: Constant[Ord
 @function
 def gather(array, indices, /, *, padding_value=0, check_bounds=True, latency=None) -> Tile:
     """
-    Loads a tile or a scalar from the `array` elements specified by `indices`.
+    Loads a tile from the `array` elements specified by `indices`.
 
     `indices` must be a tuple whose length equals the `array` rank.
     All elements of this tuple must be integer tiles or scalars of the same shape,
@@ -584,7 +619,7 @@ def gather(array, indices, /, *, padding_value=0, check_bounds=True, latency=Non
 @function
 def scatter(array, indices, value, /, *, check_bounds=True, latency=None):
     """
-    Store a tile or a scalar `value` into the `array` elements specified by `indices`.
+    Stores a tile `value` into the `array` elements specified by `indices`.
 
     `indices` must be a tuple whose length equals the `array` rank.
     All elements of this tuple must be integer tiles or scalars of the same shape,
@@ -703,6 +738,7 @@ def _doc_atomic_rmw_op(f):
     the bounds of the array, and any out-of-bounds access will result in undefined behavior.
 
     Examples:
+
         >>> indices = ct.arange(32, dtype=ct.int32)
         >>> update = ct.arange(32, dtype=ct.int32)
         >>> old_value = ct.{op_name}(array, indices, update)
@@ -819,29 +855,28 @@ def atomic_xor(array, indices, update, /, *,
 
 @function
 def arange(size, /, *, dtype) -> Tile:
-    """Create a tile with value starting from 0 to `size - 1`
-
-    TODO: Issue-238: support start, stop step.
+    """Creates a tile with value starting from 0 to `size - 1`.
 
     Args:
-        size (int): Size of the tile
+        size (const int): Size of the tile.
+        dtype (DType): Datatype of the tile.
 
     Returns:
         Tile:
 
     Examples:
 
-        >>> tile = ct.arange(16, dtype=np.int32)
+        >>> tile = ct.arange(16, dtype=ct.int32)
     """
 
 
 @function
 def full(shape: Shape, fill_value: Scalar, dtype: DType) -> Tile:
-    """Create a tile filled with const value
+    """Creates a tile filled with given value.
 
     Args:
-        shape (Shape):  The shape of the tile.
-        fill_value (Union[int, float, bool]): Constant value for the tile.
+        shape (tuple[const int,...]):  The shape of the tile.
+        fill_value (int | float | bool]): Value for the tile.
         dtype (DType): The |Data type| of the tile.
 
     Returns:
@@ -849,16 +884,16 @@ def full(shape: Shape, fill_value: Scalar, dtype: DType) -> Tile:
 
     Examples:
 
-        >>> tile = ct.full((4, 4), 3.14, dtype=np.float32)
+        >>> tile = ct.full((4, 4), 3.14, dtype=ct.float32)
     """
 
 
 @function
 def ones(shape, dtype) -> Tile:
-    """Create a tile filled with ones
+    """Creates a tile filled with ones.
 
     Args:
-        shape (Shape):  The shape of the tile.
+        shape (tuple[const int,...]):  The shape of the tile.
         dtype (DType): The |Data type| of the tile.
 
     Returns:
@@ -866,16 +901,16 @@ def ones(shape, dtype) -> Tile:
 
     Examples:
 
-        >>> tile = ct.ones((4, 4), dtype=np.float32)
+        >>> tile = ct.ones((4, 4), dtype=ct.float32)
     """
 
 
 @function
 def zeros(shape, dtype) -> Tile:
-    """Create a tile filled with zeros
+    """Creates a tile filled with zeros.
 
     Args:
-        shape (Shape):  The shape of the tile.
+        shape (tuple[const int,...]):  The shape of the tile.
         dtype (DType): The |Data type| of the tile.
 
     Returns:
@@ -883,7 +918,7 @@ def zeros(shape, dtype) -> Tile:
 
     Examples:
 
-        >>> tile = ct.zeros((4, 4), dtype=np.float32)
+        >>> tile = ct.zeros((4, 4), dtype=ct.float32)
     """
 
 # =========== Matmul ============
@@ -891,12 +926,16 @@ def zeros(shape, dtype) -> Tile:
 
 @function
 def mma(x, y, /, acc) -> Tile:
-    """Perform matrix multiply and accumulate on tile
+    """Matrix multiply-accumulate.
+
+    Computes ``(x @ y) + acc`` as a single operation
+    (where ``@`` denotes matrix multiplication).
+    Preserves the dtype of `acc`.
 
     Args:
-        x (Tile): LHS of the mma, 2D or 3D
-        y (Tile): RHS of the mma, 2D or 3D
-        acc (Tile): Accumulator of mma
+        x (Tile): LHS of the mma, 2D or 3D.
+        y (Tile): RHS of the mma, 2D or 3D.
+        acc (Tile): Accumulator of mma.
 
     Supported datatypes:
 
@@ -938,11 +977,11 @@ def mma(x, y, /, acc) -> Tile:
 
 @function
 def matmul(x, y, /) -> Tile:
-    """Perform matrix multiply on tile
+    """Performs matrix multiply on the given tiles.
 
     Args:
-        x (Tile): LHS of the matmul, 1D, 2D, or 3D
-        y (Tile): RHS of the matmul, 1D, 2D, or 3D
+        x (Tile): LHS of the matmul, 1D, 2D, or 3D.
+        y (Tile): RHS of the matmul, 1D, 2D, or 3D.
 
     Supported input datatypes: [f16, bf16, f32, f64, tf32, f8e4m3fn, f8e5m2, i8, u8]
 
@@ -955,8 +994,8 @@ def matmul(x, y, /) -> Tile:
 
     Example:
 
-        >>> tx = ct.full((2, 4), 3, dtype=np.float32)
-        >>> ty = ct.full((4, 8), 4, dtype=np.float32)
+        >>> tx = ct.full((2, 4), 3, dtype=ct.float32)
+        >>> ty = ct.full((4, 8), 4, dtype=ct.float32)
         # default
         >>> tz = ct.matmul(tx, ty)
         # use builtin `@`
@@ -967,20 +1006,20 @@ def matmul(x, y, /) -> Tile:
 # ======== Shape and Dtype ==============
 @function
 def expand_dims(x, /, axis) -> Tile:
-    """Expands dimensions of tile along axis
+    """Reshapes the tile by inserting a new axis of size 1 at given position.
 
-    This can also be done via the numpy style syntax: `x[:, None]` or `x[np.newaxis, :]`
+    This can also be done via the NumPy-style syntax: `x[:, None]` or `x[np.newaxis, :]`
 
     Args:
-        x (Tile): input tile
-        axis (int): axis to expand the tile dimension
+        x (Tile): input tile.
+        axis (const int): axis to expand the tile dimension.
 
     Returns:
         Tile:
 
     Examples:
 
-        >>> tx = ct.arange(16, dtype=np.float32)
+        >>> tx = ct.arange(16, dtype=ct.float32)
         >>> tx.shape
         (16,)
         >>> ty = ct.expand_dims(x, 1)
@@ -994,11 +1033,11 @@ def expand_dims(x, /, axis) -> Tile:
 
 @function
 def cat(tiles, /, axis) -> Tile:
-    """Concatenates two tiles along axis.
+    """Concatenates two tiles along the `axis`.
 
     Args:
         tiles (tuple): a pair of tiles to concatenate.
-        axis (int): axis to concatenates the tiles
+        axis (const int): axis to concatenate the tiles.
 
     Returns:
         Tile:
@@ -1009,8 +1048,8 @@ def cat(tiles, /, axis) -> Tile:
 
     Examples:
 
-        >>> tx = ct.full((2, 4), 3., dtype=np.float32)
-        >>> ty = ct.full((2, 4), 4., dtype=np.float32)
+        >>> tx = ct.full((2, 4), 3., dtype=ct.float32)
+        >>> ty = ct.full((2, 4), 4., dtype=ct.float32)
         >>> tz = ct.cat((tx, ty), 0)
         >>> tz.shape
         (4,4)
@@ -1022,19 +1061,19 @@ def cat(tiles, /, axis) -> Tile:
 
 @function
 def broadcast_to(x, /, shape) -> Tile:
-    """Broadcast a tile to the specified shape
+    """Broadcasts a tile to the specified shape
     following |Numpy broadcasting rule|.
 
     Args:
-        x (Tile): input tile
-        shape (tuple[int,...]): target shape
+        x (Tile): input tile.
+        shape (tuple[const int,...]): target shape.
 
     Returns:
         Tile:
 
     Examples:
 
-        >>> tx = ct.arange(4, dtype=np.float32)
+        >>> tx = ct.arange(4, dtype=ct.float32)
         >>> tx.shape
         (4,)
         >>> ty = ct.broadcast_to(tx, (2, 4))
@@ -1045,18 +1084,25 @@ def broadcast_to(x, /, shape) -> Tile:
 
 @function
 def reshape(x, /, shape) -> Tile:
-    """Reshape a tile to the specified shape
+    """Reshapes a tile to the specified shape.
+
+    One of the shape elements may be specified as -1 to indicate that the
+    corresponding dimension is to be inferred automatically.
+
+    For example, reshaping a ``(16, 2)`` tile to ``(8, -1)`` will
+    produce a tile of shape ``(8, 4)``: as there are 32 elements in total,
+    the second dimension will be computed as 32 divided by 8.
 
     Args:
-        x (Tile): input tile
-        shape (Shape): target shape
+        x (Tile): input tile.
+        shape (tuple[const int,...]): target shape.
 
     Returns:
         Tile:
 
     Examples:
 
-        >>> tx = ct.arange(8, dtype=np.float32)
+        >>> tx = ct.arange(8, dtype=ct.float32)
         >>> tx.shape
         (8,)
         >>> ty = ct.reshape(tx, (2, 4))
@@ -1070,18 +1116,18 @@ def reshape(x, /, shape) -> Tile:
 
 @function
 def permute(x, /, axes) -> Tile:
-    """Permute axes of the input tile
+    """Permutes the axes of the input tile.
 
     Args:
-        x (Tile): input tile
-        axes (tuple[int,...]): the desired axes order
+        x (Tile): input tile.
+        axes (tuple[const int,...]): the desired axes order.
 
     Returns:
         Tile:
 
     Examples:
 
-        >>> tx = ct.full((2, 4, 8), 0., dtype=np.float32)
+        >>> tx = ct.full((2, 4, 8), 0., dtype=ct.float32)
         >>> ty = ct.permute(tx, (0, 2, 1))
         >>> ty.shape
         (2, 8, 4)
@@ -1090,26 +1136,26 @@ def permute(x, /, axes) -> Tile:
 
 @function
 def transpose(x, /, axis0=None, axis1=None) -> Tile:
-    """Transpose two axes of the input tile with at least 2 dimensions.
+    """Transposes two axes of the input tile with at least 2 dimensions.
 
     For a 2-dimensional tile, the two axes are transposed if `axis0` and `axis1` are not specified.
     For tiles with more than 2 dimensions, `axis0` and `axis1` must be explicitly specified.
 
     Args:
-        x (Tile): input tile
-        axis0 (int): the first axis to transpose
-        axis1 (int): the second axis to transpose
+        x (Tile): input tile.
+        axis0 (const int): the first axis to transpose.
+        axis1 (const int): the second axis to transpose.
 
     Returns:
         Tile:
 
     Examples:
 
-        >>> tx = ct.full((2, 4, 8), 0., dtype=np.float32)
+        >>> tx = ct.full((2, 4, 8), 0., dtype=ct.float32)
         >>> ty = ct.transpose(tx, axis0=0, axis1=1)
         >>> ty.shape
         (4, 2, 8)
-        >>> tx = ct.full((2, 4), 0., dtype=np.float32)
+        >>> tx = ct.full((2, 4), 0., dtype=ct.float32)
         >>> ty = ct.transpose(tx)
         >>> ty.shape
         (4, 2)
@@ -1118,19 +1164,19 @@ def transpose(x, /, axis0=None, axis1=None) -> Tile:
 
 @function
 def astype(x, dtype, /) -> Tile:
-    """Convert a tile to the specified data type
+    """Converts a tile to the specified data type.
 
     Args:
-        x (Tile or Scalar): input tile or scalar
-        dtype (DType): target data type
+        x (Tile): input tile.
+        dtype (DType): target data type.
 
     Returns:
-        Tile or Scalar:
+        Tile:
 
     Examples:
 
-        >>> tx = ct.arange(8, dtype=np.float32)
-        >>> ty = ct.astype(tx, np.float16)
+        >>> tx = ct.arange(8, dtype=ct.float32)
+        >>> ty = ct.astype(tx, ct.float16)
         >>> ty.dtype
         float16
     """
@@ -1138,19 +1184,19 @@ def astype(x, dtype, /) -> Tile:
 
 @function
 def bitcast(x, /, dtype) -> Tile:
-    """Reinterpet tile as being of specified data type
+    """Reinterpets tile as being of specified data type.
 
     Args:
-        x (Tile): input tile
-        dtype (DType): target data type
+        x (Tile): input tile.
+        dtype (DType): target data type.
 
     Returns:
         Tile:
 
     Examples:
 
-        >>> tx = ct.arange(8, dtype=np.float32)
-        >>> ty = ct.bitcast(tx, np.int32)
+        >>> tx = ct.arange(8, dtype=ct.float32)
+        >>> ty = ct.bitcast(tx, ct.int32)
         >>> ty.dtype
         int32
     """
@@ -1168,7 +1214,7 @@ def _math_op_extra_block(f, indent):
             )
         elif name == "flush_to_zero":
             extra.append(
-                f"{name} (bool): If True, flushes subnormal inputs and results to "
+                f"{name} (const bool): If True, flushes subnormal inputs and results to "
                 "sign-preserving zero, default is False."
             )
     return ("\n" + textwrap.indent("\n".join(extra), indent)) if extra else ""
@@ -1184,20 +1230,21 @@ def _doc_reduce_op(f):
     op_name = f.__name__
     extra_block = _math_op_extra_block(f, indent="        ")
 
-    wrapped.__doc__ = f"""Perform {op_name} reduction on tile along axis
+    wrapped.__doc__ = f"""Performs {op_name} reduction on tile along the `axis`.
 
     Args:
-        x (Tile): input tile
-        axis (None or int or tuple of ints): the axis for reduction.
+        x (Tile): input tile.
+        axis (None | const int | tuple[const int,...]): the axis for reduction.
             The default, `axis=None`, will reduce all of the elements.
-        keep_dims (bool): If true, preserve the number of dimension from the input tile{extra_block}
+        keep_dims (const bool): If true, preserves the number of dimension
+            from the input tile.{extra_block}
 
     Returns:
         Tile:
 
     Examples:
 
-        >>> tx = ct.full((2, 4), 3, dtype=np.float32)
+        >>> tx = ct.full((2, 4), 3, dtype=ct.float32)
         >>> ty = ct.{op_name}(tx, 1)
         >>> ty.shape
         (2,)
@@ -1257,19 +1304,19 @@ def _doc_scan_op(f):
     op_name = f.__name__
     extra_block = _math_op_extra_block(f, indent="        ")
 
-    wrapped.__doc__ = f"""Perform {op_name} on tile along axis
+    wrapped.__doc__ = f"""Performs {op_name} on tile along the `axis`.
 
     Args:
         x (Tile): input tile
-        axis (int): the axis for scan, default 0.
-        reverse (bool): if True, the scan is performed in the reverse direction{extra_block}
+        axis (const int): the axis for scan, default 0.
+        reverse (const bool): if True, the scan is performed in the reverse direction.{extra_block}
 
     Returns:
         Tile:
 
     Examples:
 
-        >>> tx = ct.full((2, 4), 3, dtype=np.float32)
+        >>> tx = ct.full((2, 4), 3, dtype=ct.float32)
         >>> ty = ct.{op_name}(tx, 1)
         >>> ty.shape
         (2, 4)
@@ -1310,42 +1357,42 @@ def _doc_binary_op(builtin_op):
         else:
             builtin_example = f"{{}} {builtin_op} {{}}"
 
-        wrapped.__doc__ = f"""Elementwise {op_name} on two tiles or scalars
+        wrapped.__doc__ = f"""Elementwise {op_name} on two tiles.
 
         Can also use builtin operation `{builtin_example.format('x', 'y')}`.
 
         Args:
-            x (Tile or Scalar): LHS tile or scalar
-            y (Tile or Scalar): RHS tile or scalar{extra_block}
+            x (Tile): LHS tile.
+            y (Tile): RHS tile.{extra_block}
 
         The `shape` of `x` and `y` will be broadcasted and
-        `dtype` promoted to common dtype
+        `dtype` promoted to common dtype.
 
         Returns:
-            Tile or Scalar:
+            Tile:
 
         Examples:
 
             >>> # tile and tile
-            >>> tx = ct.full((2, 4), 7, dtype=np.int32)
-            >>> ty = ct.full((2, 4), 3, dtype=np.int32)
+            >>> tx = ct.full((2, 4), 7, dtype=ct.int32)
+            >>> ty = ct.full((2, 4), 3, dtype=ct.int32)
             >>> tz = ct.{op_name}(tx, ty)
 
             >>> # Can also use the builtin op
             >>> tz = {builtin_example.format('tx', 'ty')}
 
             >>> # shape broadcast
-            >>> tx = ct.full((2, 4), 7, dtype=np.int32)
-            >>> ty = ct.full((2,), 3, dtype=np.int32)
+            >>> tx = ct.full((2, 4), 7, dtype=ct.int32)
+            >>> ty = ct.full((2,), 3, dtype=ct.int32)
             >>> tz = {builtin_example.format('tx', 'ty')}
 
             >>> # dtype cast
-            >>> tx = ct.full((2, 4), 7, dtype=np.int32)
-            >>> ty = ct.full((2, 4), 3, dtype=np.int64)
+            >>> tx = ct.full((2, 4), 7, dtype=ct.int32)
+            >>> ty = ct.full((2, 4), 3, dtype=ct.int64)
             >>> tz = {builtin_example.format('tx', 'ty')}
 
             >>> # tile and scalar
-            >>> tx = ct.full((2, 4), 7, dtype=np.int32)
+            >>> tx = ct.full((2, 4), 7, dtype=ct.int32)
             >>> y = 2
             >>> tz = {builtin_example.format('tx', 'y')}
 
@@ -1434,19 +1481,19 @@ def bitwise_rshift(x, y, /) -> TileOrScalar:
 
 @function
 def bitwise_not(x, /) -> TileOrScalar:
-    """Elementwise bitwise not on a tile or scalar
+    """Elementwise bitwise not on a tile.
 
     Can also use builtin operator `~x`.
 
     Args:
-        x (Tile or Scalar): input tile or scalar
+        x (Tile): input tile.
 
     Returns:
-        Tile or Scalar:
+        Tile:
 
     Examples:
 
-        >>> tx = ct.full((4, 4), 0, dtype=np.int32)
+        >>> tx = ct.full((4, 4), 0, dtype=ct.int32)
         >>> ty = ct.bitwise_not(x)
         >>> ty = ~tx
     """
@@ -1468,18 +1515,18 @@ def maximum(x, y, /, *, flush_to_zero: bool = False) -> TileOrScalar:
 
 @function
 def cdiv(x, y, /) -> TileOrScalar:
-    """Computes ceil(x / y) for two integer tiles
+    """Computes ceil(x / y) for two integer tiles.
 
     Args:
-        x (Tile or Scalar): int tile or scalar
-        y (Tile or Scalar): int tile or scalar
+        x (Tile): int tile.
+        y (Tile): int tile.
 
     Returns:
-        Tile or Scalar:
+        Tile:
 
     Examples:
 
-        >>> tile = ct.full((2, 2), 7, dtype=np.int32)
+        >>> tile = ct.full((2, 2), 7, dtype=ct.int32)
         >>> ct.cdiv(tile, 4)
         Tile((2,2), dtype=int32)
 
@@ -1498,42 +1545,42 @@ def _doc_cmp_op(builtin_op):
 
         op_name = f.__name__
 
-        wrapped.__doc__ = f"""Compare two tiles or scalars elementwise with `{builtin_op}`
+        wrapped.__doc__ = f"""Compare two tiles elementwise with `{builtin_op}`.
 
         Can also use builtin operation `x {builtin_op} y`.
 
         Args:
-            x (Tile or Scalar): LHS tile or scalar
-            y (Tile or Scalar): RHS tile or scalar
+            x (Tile): LHS tile.
+            y (Tile): RHS tile.
 
         The `shape` of `x` and `y` will be broadcasted and
-        `dtype` promoted to common dtype
+        `dtype` promoted to common dtype.
 
         Returns:
-            Tile or Scalar:
+            Tile:
 
         Examples:
 
             >>> # tile and tile
-            >>> tx = ct.arange(8, dtype=np.int32) - 4
-            >>> ty = ct.arange(8, dtype=np.int32)
+            >>> tx = ct.arange(8, dtype=ct.int32) - 4
+            >>> ty = ct.arange(8, dtype=ct.int32)
             >>> tz = ct.{op_name}(tx, ty)
 
             >>> # Can also use the builtin op
             >>> tz = tx {builtin_op} ty
 
             >>> # shape broadcast
-            >>> tx = ct.arange(8, dtype=np.int32)
-            >>> ty = ct.full((1,), 0, dtype=np.int32)
+            >>> tx = ct.arange(8, dtype=ct.int32)
+            >>> ty = ct.full((1,), 0, dtype=ct.int32)
             >>> tz = tx {builtin_op} ty
 
             >>> # dtype broadcast
-            >>> tx = ct.arange(8, dtype=np.int32) - 4
-            >>> ty = ct.arange(8, dtype=np.int64)
+            >>> tx = ct.arange(8, dtype=ct.int32) - 4
+            >>> ty = ct.arange(8, dtype=ct.int64)
             >>> tz = tx {builtin_op} ty
 
             >>> # tile and scalar
-            >>> tx = ct.arange(8, dtype=np.int32) - 4
+            >>> tx = ct.arange(8, dtype=ct.int32) - 4
             >>> tz = tx {builtin_op} 0
 
             >>> # scalar and scala
@@ -1590,17 +1637,17 @@ def _doc_unary_op(f):
     extra_block = _math_op_extra_block(f, indent="        ")
 
     wrapped.__doc__ = f"""
-    Perform `{op_name}` on a tile or scalar
+    Perform `{op_name}` on a tile.
 
     Args:
-        x (Tile or Scalar):{extra_block}
+        x (Tile):{extra_block}
 
     Returns:
-        Tile or Scalar:
+        Tile:
 
     Examples:
 
-        >>> tx = ct.full((32, 32), 3.0, dtype=np.float32)
+        >>> tx = ct.full((32, 32), 3.0, dtype=ct.float32)
         >>> tx = ct.{op_name}(tx)
     """
     return wrapped
@@ -1696,15 +1743,15 @@ def negative(x, /) -> TileOrScalar:
     """Same as `-x`.
 
     Args:
-        x (Tile or Scalar): input tile or scalar
+        x (Tile): input tile.
 
     Returns:
-        Tile or Scalar:
+        Tile:
 
     Examples:
 
         >>> Negate a tile
-        >>> tx = ct.arange(8, dtype=np.int32)
+        >>> tx = ct.arange(8, dtype=ct.int32)
         >>> ty = ct.negative(tx)
         >>> ty = -tx
 
@@ -1718,22 +1765,22 @@ def negative(x, /) -> TileOrScalar:
 
 @function
 def where(cond, x, y, /) -> Tile:
-    """Return elements chosen from x or y depending on condition
+    """Returns elements chosen from x or y depending on condition.
 
     Args:
         cond (Tile): Boolean tile of shape `S`.
-        x (Tile or Scalar): Tile of shape `S` and dtype `T`, or scalar. selected if `cond` is True
-        y (Tile or Scalar): Tile of shape `S` and dtype `T`, or scalar. selected if `cond` is False
+        x (Tile): Tile of shape `S` and dtype `T`, selected if `cond` is True.
+        y (Tile): Tile of shape `S` and dtype `T`, selected if `cond` is False.
 
     Returns:
         Tile:
 
     Examples:
 
-        >>> cond = ct.arange(4, dtype=np.int32)
+        >>> cond = ct.arange(4, dtype=ct.int32)
         >>> cond = cond > 2
-        >>> x_true = ct.full((4,), 1.0, dtype=np.float32)
-        >>> x_false = ct.full((4,), -1.0, dtype=np.float32)
+        >>> x_true = ct.full((4,), 1.0, dtype=ct.float32)
+        >>> x_false = ct.full((4,), -1.0, dtype=ct.float32)
         >>> y = ct.where(cond, x_true, x_false)
         >>> y
         [1., 1., -1., -1.]
@@ -1745,14 +1792,14 @@ def where(cond, x, y, /) -> Tile:
 
 @function
 def extract(x, /, index, shape) -> Tile:
-    """Extracts a sub tile from input tile
+    """Extracts a smaller tile from input tile.
 
     Partition the input tile into a grid with subtile shape
     and return a tile given the index into the grid. Similar
     to :py:func:`load` but performed on a tile.
 
     Args:
-        x (Tile): input tile
+        x (Tile): input tile.
         index (Shape): An index in the sub |tile space|.
         shape (Shape): The shape of the extracted tile.
 
@@ -1761,7 +1808,7 @@ def extract(x, /, index, shape) -> Tile:
 
     Examples:
 
-        >>> tile = ct.full((8, 8), 3.14, dtype=np.float32)
+        >>> tile = ct.full((8, 8), 3.14, dtype=ct.float32)
         >>> sub_tile = ct.extract(x, (0, 0), shape=(4, 4))
         >>> sub_tile.shape
         (4, 4)
@@ -1780,16 +1827,19 @@ def printf(format, *args) -> None:
             where specifier is limited to integer and float for now, i.e.
             ``[diuoxXeEfFgGaA]``
 
-        *args (tuple[TileOrScalar, ...]):
-            Only tile or scalar input is supported.
+        *args (tuple[Tile, ...]):
+            Only tile input is supported.
 
     Examples:
 
-        >>> tile = ct.arange(4, dtype=np.int32)
+        >>> tile = ct.arange(4, dtype=ct.int32)
         >>> ct.printf("one tile: %d", tile)
         >>> ct.printf("two tiles: %d, %f", tile, tile * 2.0)
 
     Notes:
+        This operation has significant overhead, and should only be used
+        for debugging purpose.
+
         When printing from multiple tile blocks, outputs will be interleaved.
         One workaround is to set optimization level to 0:
 
@@ -1809,9 +1859,14 @@ def assert_(cond, /, message=None) -> None:
         cond (Tile): Boolean tile.
         message (str): Message to print if condition is false.
 
+    Notes:
+        This operation has significant overhead, and should only be used
+        for debugging purpose.
+
+
     Examples:
 
-        >>> tile = ct.arange(4, dtype=np.int32)
+        >>> tile = ct.arange(4, dtype=ct.int32)
         >>> ct.assert_(tile > 2)
         >>> ct.assert_(tile > 2, "Not all elements in tile are greater than 2")
     """

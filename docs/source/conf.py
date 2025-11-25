@@ -36,6 +36,7 @@ exclude_patterns = ['references.rst', 'stubs', 'generated/includes']
 
 # Autodoc settings
 autodoc_member_order = 'bysource'
+autodoc_typehints = 'none'
 toc_object_entries = False  # Don't include object entries in the TOC
 
 # -- Options for HTML output -------------------------------------------------
