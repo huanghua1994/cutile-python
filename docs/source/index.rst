@@ -36,7 +36,7 @@ However, there are important differences:
 - |Tiles| are immutable values without defined storage that only exist in the kernel code.
   Tile dimensions must be compile-time constants that are powers of two.
   Tiles support a multitude of |operations|, including elementwise arithmetic,
-  matrix multiplication, reduction, shape manipulation etc.
+  matrix multiplication, reduction, shape manipulation, etc.
 
 Proceed to the :ref:`quickstart` page for installation instructions and a complete working example.
 

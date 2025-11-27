@@ -26,7 +26,7 @@ cuTile Python requires the following:
 Installing cuTile Python
 -------------------------------------------------------------------------------
 
-With the :ref:`prerequisites <quickstart-prereqs>` met, installing cuTile python is a simple pip install: 
+With the :ref:`prerequisites <quickstart-prereqs>` met, installing cuTile Python is a simple pip install:
 
 .. code-block::  bash
 
@@ -45,7 +45,7 @@ The quickstart sample on this page uses cupy, which can be installed with:
     pip install cupy-cuda13x
 
 
-The cuTile Python samples in the ```samples/``` directory also use pytest, torch, and numpy packages. 
+The cuTile Python samples in the ``samples/`` directory also use pytest, torch, and numpy packages.
 
 For torch installation instructions, see `<https://pytorch.org/get-started/locally/>`__. 
 
@@ -68,8 +68,7 @@ This example shows a structure common to cuTile kernels:
 * Write the resulting tile(s) out to GPU memory
 
 In this case, the kernel loads tiles from two vectors, ``a`` and ``b``. These loads create tiles called ``a_tile`` and ``b_tile``. These tiles are added together to form a third tile, called ``result``. In the last step, the kernel stores the ``result`` tile to the output vector ``c``.
- 
-This code can be found in the cuTile Python repository at ``samples/quickstart/VectorAdd_quicstart.py``. 
+This code can be found in the cuTile Python repository at ``samples/quickstart/VectorAdd_quickstart.py``.
 
 .. literalinclude:: ../../samples/quickstart/VectorAdd_quickstart.py
    :language: python
@@ -114,8 +113,8 @@ Developer Tools
 
     ncu -o VecAddProfile --set detailed python3 VectorAdd_quickstart.py
 
-This profile can then be loaded in a graphical instance of Nsight Compute and the kernel ``vector_add`` selected to see statistcs about the kernel. 
+This profile can then be loaded in a graphical instance of Nsight Compute and the kernel ``vector_add`` selected to see statistics about the kernel.
 
 .. note:: 
-    Capturing detailed statistics for cuTile Python kernels require running on NVIDA Driver r590 or later.
+    Capturing detailed statistics for cuTile Python kernels requires running on NVIDIA Driver r590 or later.
 

@@ -82,7 +82,7 @@ Shape Broadcasting
 ------------------
 
 *Shape broadcasting* allows |tiles| with different shapes to be combined in arithmetic operations.
-When performing operations between |tiles| of different shapes, smaller |tile| is automatically
+When performing operations between |tiles| of different shapes, the smaller |tile| is automatically
 extended to match the shape of the larger one, following these rules:
 
 - |Tiles| are aligned by their trailing dimensions.
@@ -120,11 +120,11 @@ If any of the operands is not a |loosely typed numeric constant|, then both are 
 to a common dtype using the following process:
 
 - Each operand is classified into one of the three categories:
-  *boolean*, *integral* or *floating-point*.
+  *boolean*, *integral*, or *floating-point*.
   The categories are ordered as follows: *boolean* < *integral* < *floating-point*.
 - If either operand is a |loosely typed numeric constant|, a concrete dtype is picked for it:
-  integral constants are treated as `int32`, `int64` or `uint64`, depending on the value;
-  floating-point constants as treated as `float32`.
+  integral constants are treated as `int32`, `int64`, or `uint64`, depending on the value;
+  floating-point constants are treated as `float32`.
 - If one of the two operands has a higher category than the other, then its concrete dtype
   is chosen as the common dtype.
 - If both operands are of the same category, but one of them is a |loosely typed numeric constant|,

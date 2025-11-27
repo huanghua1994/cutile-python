@@ -22,7 +22,7 @@ Scalar operations are executed serially by a single thread of the |block|,
 and array operations are collectively executed in parallel by all threads of
 the |block|.
 
-Tile programs explicitly describe for |block|-level parallelism, but not
+Tile programs explicitly describe |block|-level parallelism, but not
 thread-level parallelism.
 Threads cannot be explicitly identified or manipulated in tile programs.
 
@@ -58,7 +58,7 @@ The set of *targets* that such a construct is usable on is called its *execution
 
 - *Host code* is the execution space that includes all CPU targets.
 - *SIMT code* is the execution space that includes all CUDA SIMT targets.
-     Note: This has historically been called device code, but we avoid this term to prevent ambiguity.
+  Note: This has historically been called device code, but we avoid this term to prevent ambiguity.
 - *Tile code* is the execution space that includes all CUDA tile targets.
 
 Functions can have decorators that explicitly specify their execution space.
@@ -139,7 +139,7 @@ Some facilities require certain parameters to be an object that is known statica
 - A global object that is defined at the time of compilation or launch.
 
 By default, numeric constants are *loosely typed*: until used in a context that requires
-a type of specific width, integer constants have infinite precision, and floating-point
+a type of a specific width, integer constants have infinite precision, and floating-point
 constants are stored in the IEEE 754 double precision format.
 
 A *strictly typed* constant can be created by calling a dtype object as a constructor,

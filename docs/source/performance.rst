@@ -9,7 +9,7 @@ Performance Tuning
 
 Several performance tuning techniques are available in cuTile:
 
-* architecture–specific configuration values, using :class:`ByTarget`;
+* architecture-specific configuration values, using :class:`ByTarget`;
 * load/store hints such as ``latency`` and ``allow_tma``.
 
 

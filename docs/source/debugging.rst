@@ -27,13 +27,13 @@ development.
 Set ``CUDA_TILE_ENABLE_CRASH_DUMP=1`` to enable dumping
 an archive including the TileIR bytecode
 for submitting a bug report on :class:`TileCompilerExecutionError`
-or class:`TileCompilerTimeoutError`.
+or :class:`TileCompilerTimeoutError`.
 
 Set ``CUDA_TILE_COMPILER_TIMEOUT_SEC`` to limit the
 time the TileIR compiler `tileiras` can take.
 
-Set ``CUDA_TILE_LOGS=CUTILEIR`` to print cuTile python
-IR during compilation to stderr. This is usefule when
+Set ``CUDA_TILE_LOGS=CUTILEIR`` to print cuTile Python
+IR during compilation to stderr. This is useful when
 debugging :class:`TileTypeError`.
 
 Set ``CUDA_TILE_TEMP_DIR`` to configure the directory
