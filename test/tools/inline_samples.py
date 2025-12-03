@@ -122,8 +122,9 @@ def get_helper_nodes(
                     import_nodes_to_add[name] = NodeRef(module_file, imp, _next_seq())
             else:
                 import_nodes_to_add[name] = NodeRef(module_file, imp, _next_seq())
-        else:
-            warnings.warn(f"Unknown name: {name}, it will not be inlined to the sample.")
+        elif name not in dir(__builtins__):
+            warnings.warn(f"Unknown non-builtin name used in {module_file}: {name}, "
+                          "it will not be inlined to the sample.")
 
 
 def get_all_nodes(tree: ast.Module) -> tuple:
