@@ -103,6 +103,7 @@ BUILTIN_FUNCS = {
     operator.gt: lambda x, y, /: None,
     operator.ge: lambda x, y, /: None,
     operator.is_: lambda x, y, /: None,
+    operator.is_not: lambda x, y, /: None,
     operator.invert: lambda x, /: None,
     operator.not_: lambda x, /: None,
     operator.pos: lambda x, /: None,

@@ -186,7 +186,7 @@ def _binop_expr(binop: ast.BinOp, block: ir.Block, ctx: _Context) -> ir.Var:
 
 _cmp_map = {
     ast.Eq: operator.eq, ast.NotEq: operator.ne, ast.Lt: operator.lt, ast.LtE: operator.le,
-    ast.Gt: operator.gt, ast.GtE: operator.ge, ast.Is: operator.is_
+    ast.Gt: operator.gt, ast.GtE: operator.ge, ast.Is: operator.is_, ast.IsNot: operator.is_not,
 }
 
 

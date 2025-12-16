@@ -95,24 +95,19 @@ def test_none_as_constant():
     compile_tile(kernel, (), CompilerOptions())
 
 
-def test_is_op_on_constant():
-
-    def kernel():
-        None is None
-        None is ct.bid(0)
-        ct.bid(0) is None
-
-    compile_tile(kernel, (), CompilerOptions())
-
-
-def test_is_op_on_none_constant():
+@pytest.mark.parametrize("negate", [False, True])
+def test_is_or_not_op_on_none_constant(negate):
 
     def kernel():
         tx = ct.full((1,), 0, ct.float32)
         ty = ct.full((1,), 0, ct.float32)
-        tx is ty
+        if negate:
+            tx is not ty
+        else:
+            tx is ty
 
-    msg = re.escape("Operator 'is' expects one of the operands to be None")
+    op_name = 'is not' if negate else 'is'
+    msg = re.escape(f"Operator '{op_name}' expects one of the operands to be None")
     with pytest.raises(TileTypeError, match=msg):
         compile_tile(kernel, (), CompilerOptions())
 

@@ -278,6 +278,34 @@ def test_array_compare(shape, tile, dtype, op_symbol, op_func, tmp_path):
         assert_equal(z, ref)
 
 
+def make_is_operator_kernel(cmp):
+    @ct.kernel
+    def is_operator(x):
+        bid = ct.bid(0)
+        a = 1 if cmp is None else -1
+        ct.store(x, index=(bid,), tile=a)
+    return is_operator
+
+
+def make_is_not_operator_kernel(cmp):
+    @ct.kernel
+    def is_not_operator(x):
+        bid = ct.bid(0)
+        a = -1 if cmp is not None else 1
+        ct.store(x, index=(bid,), tile=a)
+    return is_not_operator
+
+
+@pytest.mark.parametrize("make_kernel", [make_is_operator_kernel, make_is_not_operator_kernel])
+@pytest.mark.parametrize("cmp", [None, 1])
+def test_is_or_not_operator(make_kernel, cmp):
+    x = torch.zeros((1,), dtype=torch.int32, device='cuda')
+    kernel = make_kernel(cmp)
+    ct.launch(torch.cuda.current_stream(), (1, 1, 1), kernel, (x, ))
+    ref = 1 if cmp is None else -1
+    assert_equal(x, torch.tensor([ref], dtype=torch.int32, device='cuda'))
+
+
 @pytest.mark.parametrize("max_func", ["max", "ct.maximum"])
 @pytest.mark.parametrize("dtype", int_dtypes + float_dtypes, ids=dtype_id)
 def test_array_max(shape, tile, dtype, tmp_path, max_func):

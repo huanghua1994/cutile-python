@@ -726,16 +726,22 @@ def comparison(fn: str, x: Var, y: Var) -> Var:
     return raw_comparison(fn, x, y)
 
 
+def _is_none_compare(x: Var, y: Var, *, negate: bool, op_name: str) -> Var:
+    x_is_none = x.get_type() is NONE
+    y_is_none = y.get_type() is NONE
+    if not (x_is_none or y_is_none):
+        raise TileTypeError(f"Operator '{op_name}' expects one of the operands to be None")
+    return loosely_typed_const((x_is_none == y_is_none) ^ negate)
+
+
 @impl(operator.is_)
 def operator_is_impl(x: Var, y: Var):
-    x_ty = x.get_type()
-    y_ty = y.get_type()
-    if x_ty is NONE:
-        return loosely_typed_const(y_ty is NONE)
-    elif y_ty is NONE:
-        return loosely_typed_const(x_ty is NONE)
-    else:
-        raise TileTypeError("Operator 'is' expects one of the operands to be None")
+    return _is_none_compare(x, y, negate=False, op_name="is")
+
+
+@impl(operator.is_not)
+def operator_is_not_impl(x: Var, y: Var):
+    return _is_none_compare(x, y, negate=True, op_name="is not")
 
 
 @impl(operator.eq, fixed_args=["eq"])
