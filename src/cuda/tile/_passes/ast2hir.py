@@ -4,20 +4,21 @@
 
 import ast
 import inspect
+import itertools
 import operator
 from contextlib import contextmanager
 from enum import Enum, auto
+from functools import lru_cache
 from typing import List, Sequence, Optional, Any, Dict, Type, Callable
 
 from cuda.tile import _datatype as datatype
 from cuda.tile._exception import TileSyntaxError, Loc, FunctionDesc
-from cuda.tile._ir.ir import IRContext, Var
+from cuda.tile._ir.hir import make_value
 from cuda.tile._ir import hir
 
 
-def get_function_hir(pyfunc: Callable,
-                     ir_ctx: IRContext,
-                     entry_point: bool) -> hir.Function:
+@lru_cache
+def get_function_hir(pyfunc: Callable, entry_point: bool) -> hir.Function:
     # Get the original function from the decorated function if it exists.
     pyfunc = getattr(pyfunc, "__wrapped__", pyfunc)
 
@@ -58,15 +59,15 @@ def get_function_hir(pyfunc: Callable,
 
     filename = inspect.getfile(pyfunc)
     desc = FunctionDesc(func_def.name, filename, first_line)
-    ctx = _Context(filename, first_line, desc, entry_point, ir_ctx)
+    ctx = _Context(filename, first_line, desc, entry_point)
     assert isinstance(func_def, ast.FunctionDef)
     body = _ast2hir(func_def, ctx)
     all_ast_args = _get_all_parameters(func_def, ctx)
     param_names = tuple(p.arg for p in all_ast_args)
     param_locs = tuple(ctx.get_loc(p) for p in all_ast_args)
     body.stored_names.update(param_names)
-
-    return hir.Function(desc, body, param_names, param_locs, func_globals)
+    value_id_upper_bound = next(ctx.value_id_sequence)
+    return hir.Function(desc, body, param_names, param_locs, func_globals, value_id_upper_bound)
 
 
 # Translate the 1-based line number of the chunk we passed to the AST parser
@@ -85,7 +86,7 @@ class LoopKind(Enum):
 
 class _Context:
     def __init__(self, filename: str, first_line: int, function_desc: FunctionDesc,
-                 entry_point: bool, ir_ctx: IRContext):
+                 entry_point: bool):
         self.filename = filename
         self.first_line = first_line
         self.function_desc = function_desc
@@ -93,7 +94,11 @@ class _Context:
         self.parent_loops: List[LoopKind] = []
         self.current_loc = Loc.unknown()
         self.current_block: Optional[hir.Block] = None
-        self.ir_ctx = ir_ctx
+        self.value_id_sequence = itertools.count()
+        self.block_id_sequence = itertools.count()
+
+    def make_value(self) -> hir.Value:
+        return make_value(next(self.value_id_sequence))
 
     @contextmanager
     def change_loc(self, loc: ast.AST | Loc):
@@ -105,11 +110,12 @@ class _Context:
             self.current_loc = old
 
     @contextmanager
-    def new_block(self, name: str, params: Sequence[Var] = ()):
-        name = self.ir_ctx.make_var(f"^{name}", self.current_loc).name.removeprefix("^")
+    def new_block(self, params: Sequence[hir.Value] = ()):
+        block_id = next(self.block_id_sequence)
+        new_block = hir.Block(block_id, tuple(params), calls=[], have_result=False, result=None,
+                              jump=None, jump_loc=Loc.unknown(),
+                              stored_names=set(), loc=self.current_loc)
         old = self.current_block
-        new_block = hir.Block(name, tuple(params), calls=[], results=(), jump=None,
-                              jump_loc=Loc.unknown(), stored_names=set(), loc=self.current_loc)
         self.current_block = new_block
         try:
             yield self.current_block
@@ -119,26 +125,29 @@ class _Context:
         if old is not None:
             old.stored_names.update(new_block.stored_names)
 
-    def call(self, callee, args, kwargs=()) -> Var:
-        res = self.ir_ctx.make_temp(self.current_loc)
-        self.current_block.calls.append(hir.Call((res,), callee, args, kwargs, self.current_loc))
+    def call(self, callee, args, kwargs=()) -> hir.Value:
+        res = self.make_value()
+        self.current_block.calls.append(hir.Call(res, callee, args, kwargs, self.current_loc))
         return res
 
     def call_void(self, callee, args, kwargs=()) -> None:
-        self.current_block.calls.append(hir.Call((), callee, args, kwargs, self.current_loc))
+        self.current_block.calls.append(hir.Call(None, callee, args, kwargs, self.current_loc))
 
-    def set_block_jump(self, jump: hir.Jump, results: Sequence[hir.Operand] = ()):
+    def set_block_jump(self, jump: hir.Jump):
         assert self.current_block.jump is None
         self.current_block.jump = jump
-        self.current_block.results = tuple(results)
         self.current_block.jump_loc = self.current_loc
+
+    def set_block_jump_with_result(self, jump: hir.Jump, result: hir.Operand):
+        self.set_block_jump(jump)
+        self.current_block.result = result
+        self.current_block.have_result = True
 
     def store(self, var_name: str, value: hir.Operand):
         self.call_void(hir.store_var, (var_name, value))
         self.current_block.stored_names.add(var_name)
 
-    def load(self, var_name: str) -> Var:
-        # TODO: generate more helpful variable names
+    def load(self, var_name: str) -> hir.Value:
         return self.call(hir.load_var, (var_name,))
 
     def get_loc(self, node: ast.AST) -> Loc:
@@ -174,7 +183,7 @@ _expr_handlers: Dict[Type[ast.AST], Callable] = {}
 
 
 @_register(_expr_handlers, ast.Call)
-def _call_expr(call: ast.Call, ctx: _Context) -> Var:
+def _call_expr(call: ast.Call, ctx: _Context) -> hir.Value:
     callee = _expr(call.func, ctx)
     args = tuple(_expr(a, ctx) for a in call.args)
     kwargs = tuple((a.arg, _expr(a.value, ctx)) for a in call.keywords)
@@ -182,7 +191,7 @@ def _call_expr(call: ast.Call, ctx: _Context) -> Var:
 
 
 @_register(_expr_handlers, ast.Name)
-def _name_expr(name: ast.Name, ctx: Any) -> Var:
+def _name_expr(name: ast.Name, ctx: Any) -> hir.Value:
     if not isinstance(name.ctx, ast.Load):
         raise ctx.unsupported_syntax()
     return ctx.load(name.id)
@@ -193,7 +202,7 @@ _unary_map = {ast.Invert: operator.invert, ast.Not: operator.not_,
 
 
 @_register(_expr_handlers, ast.UnaryOp)
-def _unary_op(unary: ast.UnaryOp, ctx: _Context) -> Var:
+def _unary_op(unary: ast.UnaryOp, ctx: _Context) -> hir.Value:
     op_func = _unary_map.get(type(unary.op))
     if op_func is None:
         raise ctx.unsupported_syntax()
@@ -213,7 +222,7 @@ _binop_map = {
 
 
 @_register(_expr_handlers, ast.BinOp)
-def _binop_expr(binop: ast.BinOp, ctx: _Context) -> Var:
+def _binop_expr(binop: ast.BinOp, ctx: _Context) -> hir.Value:
     op_func = _binop_map.get(type(binop.op))
     if op_func is None:
         raise ctx.unsupported_syntax()
@@ -229,7 +238,7 @@ _cmp_map = {
 
 
 @_register(_expr_handlers, ast.Compare)
-def _compare_expr(cmp: ast.Compare, ctx: _Context) -> Var:
+def _compare_expr(cmp: ast.Compare, ctx: _Context) -> hir.Value:
     """
     cond = left $op0 comparator0 $op1 comparator1 $op2 comparator2
     -->
@@ -255,21 +264,21 @@ def _compare_expr(cmp: ast.Compare, ctx: _Context) -> Var:
     if len(cmp.ops) == 1:
         return cond0
 
-    with ctx.new_block("then") as then_block:
+    with ctx.new_block() as then_block:
         cmp.left = cmp.comparators[0]
         cmp.comparators = cmp.comparators[1:]
         cmp.ops = cmp.ops[1:]
         cond_right = _expr(cmp, ctx)
-        ctx.set_block_jump(hir.Jump.END_BRANCH, (cond_right,))
+        ctx.set_block_jump_with_result(hir.Jump.END_BRANCH, cond_right)
 
-    with ctx.new_block("else") as else_block:
-        ctx.set_block_jump(hir.Jump.END_BRANCH, (cond0,))
+    with ctx.new_block() as else_block:
+        ctx.set_block_jump_with_result(hir.Jump.END_BRANCH, cond0)
 
     return ctx.call(hir.if_else, (cond0, then_block, else_block))
 
 
 @_register(_expr_handlers, ast.Attribute)
-def _attribute_expr(attr: ast.Attribute, ctx: _Context) -> Var:
+def _attribute_expr(attr: ast.Attribute, ctx: _Context) -> hir.Value:
     value = _expr(attr.value, ctx)
     return ctx.call(getattr, (value, attr.attr))
 
@@ -282,20 +291,20 @@ def _constant_expr(node: ast.Constant, ctx: Any) -> Any:
 
 
 @_register(_expr_handlers, ast.Tuple)
-def _tuple_expr(tup: ast.Tuple, ctx: _Context) -> Var:
+def _tuple_expr(tup: ast.Tuple, ctx: _Context) -> hir.Value:
     items = tuple(_expr(x, ctx) for x in tup.elts)
     return ctx.call(hir.build_tuple, items)
 
 
 @_register(_expr_handlers, ast.Subscript)
-def _subscript_expr(subscript: ast.Subscript, ctx: _Context) -> Var:
+def _subscript_expr(subscript: ast.Subscript, ctx: _Context) -> hir.Value:
     value = _expr(subscript.value, ctx)
     index = _expr(subscript.slice, ctx)
     return ctx.call(operator.getitem, (value, index))
 
 
 @_register(_expr_handlers, ast.Slice)
-def _slice_stmt(slice_: ast.Slice, ctx: _Context) -> Var:
+def _slice_stmt(slice_: ast.Slice, ctx: _Context) -> hir.Value:
     def get_var(x: ast.AST | None):
         return None if x is None else _expr(x, ctx)
     lower, upper, step = map(get_var, (slice_.lower, slice_.upper, slice_.step))
@@ -373,9 +382,9 @@ def _propagate_return(ctx: _Context):
     #    if $returning:
     #        break
     flag = ctx.load("$returning")
-    with ctx.new_block("then") as then_block:
+    with ctx.new_block() as then_block:
         ctx.set_block_jump(hir.Jump.BREAK)
-    with ctx.new_block("else") as else_block:
+    with ctx.new_block() as else_block:
         ctx.set_block_jump(hir.Jump.END_BRANCH)
     ctx.call_void(hir.if_else, (flag, then_block, else_block))
 
@@ -390,9 +399,9 @@ def _for_stmt(stmt: ast.For, ctx: _Context):
         raise ctx.unsupported_syntax(stmt.target)
 
     ctx.parent_loops.append(LoopKind.FOR)
-    induction_var = ctx.ir_ctx.make_var(stmt.target.id, ctx.get_loc(stmt.target))
-    with ctx.new_block("body", params=(induction_var,)) as body_block:
-        with ctx.change_loc(induction_var.loc):
+    induction_var = ctx.make_value()
+    with ctx.new_block(params=(induction_var,)) as body_block:
+        with ctx.change_loc(stmt.target):
             ctx.store(stmt.target.id, induction_var)
         _stmt_list(stmt.body, ctx)
         if body_block.jump is None:
@@ -402,9 +411,10 @@ def _for_stmt(stmt: ast.For, ctx: _Context):
     ctx.call_void(hir.loop, (body_block, iterable))
 
 
-def _cast_cond_to_bool(cond: Var, ctx: _Context) -> Var:
-    with ctx.change_loc(cond.loc):
-        return ctx.call(datatype.bool_, (cond,))
+def _bool_expr(expr: ast.AST, ctx: _Context) -> hir.Value:
+    val = _expr(expr, ctx)
+    with ctx.change_loc(expr):
+        return ctx.call(datatype.bool_, (val,))
 
 
 @_register(_stmt_handlers, ast.While)
@@ -412,15 +422,14 @@ def _while_stmt(stmt: ast.While, ctx: _Context):
     if len(stmt.orelse) > 0:
         raise ctx.syntax_error("'while-else' is not supported", loc=stmt.orelse[0])
 
-    with ctx.new_block("body") as body_block:
+    with ctx.new_block() as body_block:
         # Add "if cond: pass; else: break"
-        cond = _expr(stmt.test, ctx)
-        cond = _cast_cond_to_bool(cond, ctx)
+        cond = _bool_expr(stmt.test, ctx)
 
-        with ctx.new_block("then") as then_block:
+        with ctx.new_block() as then_block:
             ctx.set_block_jump(hir.Jump.END_BRANCH)
 
-        with ctx.new_block("else") as else_block:
+        with ctx.new_block() as else_block:
             ctx.set_block_jump(hir.Jump.BREAK)
 
         ctx.call_void(hir.if_else, (cond, then_block, else_block))
@@ -436,10 +445,9 @@ def _while_stmt(stmt: ast.While, ctx: _Context):
 
 
 @_register(_expr_handlers, ast.BoolOp)
-def _boolop_expr(boolop: ast.BoolOp, ctx: _Context) -> Var:
+def _boolop_expr(boolop: ast.BoolOp, ctx: _Context) -> hir.Value:
     assert len(boolop.values) >= 2
-    cond0 = _expr(boolop.values[0], ctx)
-    cond0 = _cast_cond_to_bool(cond0, ctx)
+    cond0 = _bool_expr(boolop.values[0], ctx)
 
     if isinstance(boolop.op, ast.And):
         """
@@ -452,19 +460,18 @@ def _boolop_expr(boolop: ast.BoolOp, ctx: _Context) -> Var:
         else:
             yield c0 # False
         """
-        with ctx.new_block("then") as then_block:
+        with ctx.new_block() as then_block:
             if len(boolop.values) > 2:
                 # Consecutive operations with the same operator, such as a or b or c,
                 # are collapsed into one node with several values.
                 boolop.values = boolop.values[1:]
-                cond1 = _expr(boolop, ctx)
+                cond1 = _bool_expr(boolop, ctx)
             else:
-                cond1 = _expr(boolop.values[1], ctx)
-            cond1 = _cast_cond_to_bool(cond1, ctx)
-            ctx.set_block_jump(hir.Jump.END_BRANCH, results=(cond1,))
+                cond1 = _bool_expr(boolop.values[1], ctx)
+            ctx.set_block_jump_with_result(hir.Jump.END_BRANCH, cond1)
 
-        with ctx.new_block("else") as else_block:
-            ctx.set_block_jump(hir.Jump.END_BRANCH, results=(cond0,))
+        with ctx.new_block() as else_block:
+            ctx.set_block_jump_with_result(hir.Jump.END_BRANCH, cond0)
 
         return ctx.call(hir.if_else, (cond0, then_block, else_block))
     elif isinstance(boolop.op, ast.Or):
@@ -478,17 +485,16 @@ def _boolop_expr(boolop: ast.BoolOp, ctx: _Context) -> Var:
             c1 = cond1()
             yield c1
         """
-        with ctx.new_block("then") as then_block:
-            ctx.set_block_jump(hir.Jump.END_BRANCH, results=(cond0,))
+        with ctx.new_block() as then_block:
+            ctx.set_block_jump_with_result(hir.Jump.END_BRANCH, cond0)
 
-        with ctx.new_block("else") as else_block:
+        with ctx.new_block() as else_block:
             if len(boolop.values) > 2:
                 boolop.values = boolop.values[1:]
-                cond1 = _expr(boolop, ctx)
+                cond1 = _bool_expr(boolop, ctx)
             else:
-                cond1 = _expr(boolop.values[1], ctx)
-            cond1 = _cast_cond_to_bool(cond1, ctx)
-            ctx.set_block_jump(hir.Jump.END_BRANCH, results=(cond1,))
+                cond1 = _bool_expr(boolop.values[1], ctx)
+            ctx.set_block_jump_with_result(hir.Jump.END_BRANCH, cond1)
 
         return ctx.call(hir.if_else, (cond0, then_block, else_block))
     else:
@@ -496,32 +502,30 @@ def _boolop_expr(boolop: ast.BoolOp, ctx: _Context) -> Var:
 
 
 @_register(_expr_handlers, ast.IfExp)
-def _ifexp_expr(ifexp: ast.IfExp, ctx: _Context) -> Var:
-    cond = _expr(ifexp.test, ctx)
-    cond = _cast_cond_to_bool(cond, ctx)
+def _ifexp_expr(ifexp: ast.IfExp, ctx: _Context) -> hir.Value:
+    cond = _bool_expr(ifexp.test, ctx)
 
-    with ctx.new_block("then") as then_block:
+    with ctx.new_block() as then_block:
         then_val = _expr(ifexp.body, ctx)
-        ctx.set_block_jump(hir.Jump.END_BRANCH, results=(then_val,))
+        ctx.set_block_jump_with_result(hir.Jump.END_BRANCH, then_val)
 
-    with ctx.new_block("else") as else_block:
+    with ctx.new_block() as else_block:
         else_val = _expr(ifexp.orelse, ctx)
-        ctx.set_block_jump(hir.Jump.END_BRANCH, results=(else_val,))
+        ctx.set_block_jump_with_result(hir.Jump.END_BRANCH, else_val)
 
     return ctx.call(hir.if_else, (cond, then_block, else_block))
 
 
 @_register(_stmt_handlers, ast.If)
 def _if_stmt(stmt: ast.If, ctx: _Context) -> None:
-    cond = _expr(stmt.test, ctx)
-    cond = _cast_cond_to_bool(cond, ctx)
+    cond = _bool_expr(stmt.test, ctx)
 
-    with ctx.new_block("then") as then_block:
+    with ctx.new_block() as then_block:
         _stmt_list(stmt.body, ctx)
         if then_block.jump is None:
             ctx.set_block_jump(hir.Jump.END_BRANCH)
 
-    with ctx.new_block("else") as else_block:
+    with ctx.new_block() as else_block:
         _stmt_list(stmt.orelse, ctx)
         if else_block.jump is None:
             ctx.set_block_jump(hir.Jump.END_BRANCH)
@@ -548,7 +552,7 @@ def _return_stmt(stmt: ast.Return, ctx: _Context) -> None:
 
     return_val = None if stmt.value is None else _expr(stmt.value, ctx)
     if ctx.entry_point:
-        ctx.set_block_jump(hir.Jump.RETURN, (return_val,))
+        ctx.set_block_jump_with_result(hir.Jump.RETURN, return_val)
     else:
         ctx.store("$retval", return_val)
         ctx.store("$returning", True)
@@ -580,7 +584,7 @@ def _stmt_list(statements: Sequence[ast.stmt], ctx: _Context):
     # Process "dead" statements, i.e. the ones after a jump ("continue"/"break"/"return").
     # We still need to look at them in order to figure out the set of local variables.
     # So create a throwaway block to store these into.
-    with ctx.new_block("dummy"):
+    with ctx.new_block():
         for stmt in statements:
             _stmt(stmt, ctx)
 
@@ -601,23 +605,23 @@ def _get_all_parameters(func_def: ast.FunctionDef, ctx: _Context) -> List[ast.ar
 
 
 def _ast2hir(func_def: ast.FunctionDef, ctx: _Context) -> hir.Block:
-    with ctx.change_loc(func_def), ctx.new_block(func_def.name) as root_block:
+    with ctx.change_loc(func_def), ctx.new_block() as root_block:
         if ctx.entry_point:
             _stmt_list(func_def.body, ctx)
             # Add a Return jump to the root block if it doesn't have one
             if root_block.jump is None:
-                ctx.set_block_jump(hir.Jump.RETURN, results=(None,))
+                ctx.set_block_jump(hir.Jump.RETURN)
         else:
             # To enable early returns in a helper function, wrap the body in a loop.
             # Thus, we can use "break" to implement the return statement.
             ctx.store("$returning", False)
-            with ctx.new_block("wrapped_body") as body_block:
+            with ctx.new_block() as body_block:
                 _stmt_list(func_def.body, ctx)
                 if body_block.jump is None:
                     ctx.store("$retval", None)
                     ctx.set_block_jump(hir.Jump.BREAK)
 
             ctx.call_void(hir.loop, (body_block, None))
-            retval = ctx.load("$retval")
-            root_block.results = (retval,)
+            root_block.result = ctx.load("$retval")
+            root_block.have_result = True
     return root_block

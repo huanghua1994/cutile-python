@@ -15,7 +15,7 @@ def get_ir(func) -> ir.Block:
     x = torch.zeros(10, device="cuda")
     ir = _get_final_ir(func, (x,), default_tile_context)
     print(ir)
-    return ir
+    return ir.body
 
 
 def test_unused_loop_var():

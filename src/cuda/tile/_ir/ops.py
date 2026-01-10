@@ -18,7 +18,7 @@ from cuda.tile._exception import TileTypeError, TileSyntaxError
 from cuda.tile._ir.ir import (
     Operation, Var, Loc, Block,
     has_side_effects, terminator, add_operation, TypedOperation, Builder,
-    has_multiple_results, nested_block, PhiState, LoopVarState, JumpInfo, ControlFlowInfo,
+    has_multiple_results, nested_block, PhiState, LoopVarState,
     TupleValue, make_aggregate, RangeValue, BoundMethodValue, ArrayValue, ConstantState,
     ListValue
 )
@@ -45,6 +45,7 @@ from .ops_utils import (
     memory_scope_to_bytecode, broadcast_shapes2, is_shape_broadcastable_to, BroadcastError,
     promote_types, promote_dtypes, check_implicit_cast
 )
+from .scope import Scope, JumpInfo, ControlFlowInfo
 from .typing_support import typeof_pyval, dtype_registry, loose_type_of_pyval, get_constant_value
 from .type import (
     TupleTy, TileTy, NoneType, BoundMethodTy, SizeTy, ArrayTy,
@@ -164,23 +165,24 @@ class Loop(TypedOperation):
 async def loop_impl(body: hir.Block, iterable: Var):
     from .._passes.hir2ir import dispatch_hir_block
 
+    scope = Scope.get_current()
     range_ty = require_optional_range_type(iterable)
     if range_ty is None and body.jump == hir.Jump.BREAK and not _have_nested_jump(body.calls):
         # In ast2hir, we create a loop around the function body in order to support early returns.
         # But if there is no early return, we can remove the loop. In this case, the loop will only
         # have a "break" at the end of the loop body, and no other break/continue statements.
         info = ControlFlowInfo((), flatten=True)
-        with Builder.get_current().change_loop_info(info):
+        with scope.change_loop_info(info):
             await dispatch_hir_block(body)
-        return ()
+        return
 
     builder = Builder.get_current()
-    local_scope = builder.scope.local
     stored_names = tuple(sorted(body.stored_names))
     var_states = tuple(LoopVarState(PhiState(initial_constant_state=ConstantState.NONCONSTANT),
                                     PhiState())
                        for _ in stored_names)
-    initial_values = tuple(local_scope.get(name, builder.loc) for name in stored_names)
+    initial_values = tuple(scope.local.get(name, builder.loc) for name in stored_names)
+    body_params = []
 
     # Logic specific to `for` loops:
     if range_ty is not None:
@@ -188,19 +190,24 @@ async def loop_impl(body: hir.Block, iterable: Var):
         # to the loop's results.
         for initial_var, state in zip(initial_values, var_states, strict=True):
             state.result_phi.propagate(initial_var)
-        # Assign type to induction variable
-        body.params[0].set_type(range_ty.dtype)
+        # Create an induction variable
+        induction_var = builder.ir_ctx.make_temp(builder.loc)
+        induction_var.set_type(range_ty.dtype)
+        scope.hir2ir_varmap[body.params[0].id] = induction_var
+        body_params.append(induction_var)
 
     # Process the loop body
     loop_info = ControlFlowInfo(stored_names)
-    with nested_block(body.name, body.loc, loop_info=loop_info) as new_body:
+    body_loc = body.loc.with_call_site(scope.call_site)
+    with nested_block(body_loc) as new_body, scope.change_loop_info(loop_info), \
+            scope.local.enter_branch():
         # Define body variables. Not all of them will eventually be kept,
         # so we don't set the block parameters yet.
         body_vars = []
         for name, initial_var, state in zip(
                 stored_names, initial_values, var_states, strict=True):
             state.body_phi.propagate(initial_var, allow_loose_typing=False)
-            body_var = local_scope.redefine(name, state.body_phi.last_loc)
+            body_var = scope.local.redefine(name, state.body_phi.last_loc)
             body_var.set_type(state.body_phi.ty)
             body_vars.append(body_var)
 
@@ -245,7 +252,8 @@ async def loop_impl(body: hir.Block, iterable: Var):
     # Set the block's parameters
     all_flattened_body_vars = sum((flattened for flattened, is_valid
                                    in zip(flat_body_vars, mask, strict=True) if is_valid), ())
-    new_body.params = body.params + all_flattened_body_vars
+    body_params.extend(all_flattened_body_vars)
+    new_body.params = tuple(body_params)
     valid_var_types = tuple(v.get_type() for v, is_valid in zip(body_vars, mask, strict=True)
                             if is_valid)
 
@@ -298,8 +306,6 @@ async def loop_impl(body: hir.Block, iterable: Var):
                                                strict=True):
         if not is_valid:
             store_undefined(name, body_var.get_type_allow_invalid(), state.result_phi.last_loc)
-
-    return ()
 
 
 def _have_nested_jump(calls: Sequence[hir.Call]) -> bool:
@@ -359,20 +365,22 @@ class IfElse(TypedOperation):
         return f"if(cond={self.cond})"
 
 
-async def _flatten_branch(branch: hir.Block) -> tuple[Var, ...]:
+async def _flatten_branch(branch: hir.Block) -> Var | None:
     from .._passes.hir2ir import dispatch_hir_block
     info = ControlFlowInfo((), flatten=True)
-    with Builder.get_current().change_if_else_info(info):
+    with Scope.get_current().change_if_else_info(info):
         await dispatch_hir_block(branch)
     if len(info.jumps) == 0:
-        return ()
+        return None
     else:
         assert len(info.jumps) == 1
-        return info.jumps[0].outputs
+        jump = info.jumps[0]
+        assert len(jump.outputs) in (0, 1)
+        return None if len(jump.outputs) == 0 else jump.outputs[0]
 
 
 @impl(hir.if_else)
-async def if_else_impl(cond: Var, then_block: hir.Block, else_block: hir.Block) -> tuple[Var, ...]:
+async def if_else_impl(cond: Var, then_block: hir.Block, else_block: hir.Block) -> Var | None:
     from .._passes.hir2ir import dispatch_hir_block
 
     require_bool(cond)
@@ -386,7 +394,10 @@ async def if_else_impl(cond: Var, then_block: hir.Block, else_block: hir.Block) 
 
     # Convert the "then" branch from HIR to IR
     info = ControlFlowInfo(stored_names)
-    with nested_block(then_block.name, then_block.loc, if_else_info=info) as new_then_block:
+    scope = Scope.get_current()
+    then_loc = then_block.loc.with_call_site(scope.call_site)
+    with nested_block(then_loc) as new_then_block, scope.change_if_else_info(info), \
+            scope.local.enter_branch():
         await dispatch_hir_block(then_block)
 
     # If "then" branch doesn't yield, transform our if-else into the following:
@@ -396,16 +407,19 @@ async def if_else_impl(cond: Var, then_block: hir.Block, else_block: hir.Block) 
     #        EndBranch
     #    <else_block>
     # This is to avoid the situation where none of the branches yield.
+    else_loc = else_block.loc.with_call_site(scope.call_site)
     if len(info.jumps) == 0:
         info = ControlFlowInfo(())
-        with nested_block(else_block.name, else_block.loc, if_else_info=info) as new_else_block:
-            end_branch(())
+        with nested_block(else_loc) as new_else_block, scope.change_if_else_info(info), \
+                scope.local.enter_branch():
+            end_branch(None)
         add_operation(IfElse, (),
                       cond=cond, then_block=new_then_block, else_block=new_else_block)
         return await _flatten_branch(else_block)
 
     # Convert the "else" branch from HIR to IR
-    with nested_block(else_block.name, else_block.loc, if_else_info=info) as new_else_block:
+    with nested_block(else_loc) as new_else_block, scope.change_if_else_info(info), \
+            scope.local.enter_branch():
         await dispatch_hir_block(else_block)
 
     # Do type/constant propagation
@@ -443,11 +457,15 @@ async def if_else_impl(cond: Var, then_block: hir.Block, else_block: hir.Block) 
 
     builder = Builder.get_current()
 
-    # Get/create variables for explicit results
+    # Get/create variables for the explicit result
     num_explicit_results = num_results - len(stored_names)
-    ret = tuple(builder.ir_ctx.make_temp(builder.loc, undefined=True)
-                if res_var is None else res_var
-                for res_var in all_results[:num_explicit_results])
+    if num_explicit_results == 0:
+        ret = None
+    else:
+        assert num_explicit_results == 1
+        ret = all_results[0]
+        if ret is None:
+            ret = builder.ir_ctx.make_temp(builder.loc, undefined=True)
 
     # Update the scope for stored named
     for res_var, phi, name in zip(all_results[num_explicit_results:],
@@ -484,15 +502,15 @@ class Continue(TypedOperation):
 
 
 def continue_():
-    builder = Builder.get_current()
-    info = builder.loop_info
+    scope = Scope.get_current()
+    info = scope.loop_info
     assert info is not None
     assert not info.flatten
 
-    add_operation(Continue, (), values=())
+    builder = Builder.get_current()
+    builder.add_operation(Continue, (), dict(values=()))
     op = builder.ops[-1]
-    next_values = tuple(builder.scope.local.get(name, builder.loc)
-                        for name in info.stored_names)
+    next_values = tuple(scope.local.get(name, builder.loc) for name in info.stored_names)
     info.jumps.append(JumpInfo(op, next_values))
 
 
@@ -522,16 +540,17 @@ class Break(TypedOperation):
 
 
 def break_():
-    builder = Builder.get_current()
-    info = builder.loop_info
+    scope = Scope.get_current()
+    info = scope.loop_info
     assert info is not None
 
     if info.flatten:
         return
 
-    add_operation(Break, (), values=())
+    builder = Builder.get_current()
+    builder.add_operation(Break, (), dict(values=()))
     op = builder.ops[-1]
-    outputs = tuple(builder.scope.local.get(name, builder.loc)
+    outputs = tuple(scope.local.get(name, builder.loc)
                     for name in info.stored_names)
     info.jumps.append(JumpInfo(op, outputs))
 
@@ -557,15 +576,17 @@ class EndBranch(TypedOperation):
         return f"yield {', '.join([x.name for x in self.outputs])}"
 
 
-def end_branch(outputs):
-    builder = Builder.get_current()
-    info = builder.if_else_info
+def end_branch(output: Var | None):
+    scope = Scope.get_current()
+    info = scope.if_else_info
+    outputs = () if output is None else (output,)
     if info.flatten:
         op = None
     else:
-        add_operation(EndBranch, (), outputs=())
+        builder = Builder.get_current()
+        builder.add_operation(EndBranch, (), dict(outputs=()))
         op = builder.ops[-1]
-        outputs += tuple(builder.scope.local.get(name, builder.loc)
+        outputs += tuple(scope.local.get(name, builder.loc)
                          for name in info.stored_names)
     info.jumps.append(JumpInfo(op, outputs))
 
@@ -585,8 +606,8 @@ class Return(TypedOperation):
         return "return"
 
 
-def return_(value):
-    if value.get_type() is not NONE:
+def return_(value: Var | None):
+    if value is not None and value.get_type() is not NONE:
         raise TileTypeError("Tile kernels cannot return values")
     add_operation(Return, ())
 
@@ -3487,18 +3508,16 @@ def tile_item(tile: Var) -> Var:
 
 
 def store_var(name: str, value: Var, loc: Loc | None = None):
-    builder = Builder.get_current()
-    local_scope = builder.scope.local
+    local_scope = Scope.get_current().local
     assert local_scope.is_local_name(name)
-    new_var = local_scope.redefine(name, loc or builder.loc)
+    new_var = local_scope.redefine(name, loc or Builder.get_current().loc)
     assign(value, new_var)
 
 
 def store_undefined(name: str, ty: Type, loc: Loc | None = None):
-    builder = Builder.get_current()
-    local_scope = builder.scope.local
+    local_scope = Scope.get_current().local
     assert local_scope.is_local_name(name)
-    new_var = local_scope.redefine(name, loc or builder.loc)
+    new_var = local_scope.redefine(name, loc or Builder.get_current().loc)
     new_var.set_undefined()
     new_var.set_type(ty)
 
@@ -3512,16 +3531,16 @@ def store_var_impl(name: Var, value: Var):
 @impl(hir.load_var)
 def load_var_impl(name):
     name = require_constant_str(name)
-    builder = Builder.get_current()
-    local_scope = builder.scope.local
+    scope = Scope.get_current()
+    local_scope = scope.local
     if local_scope.is_local_name(name):
         ret = local_scope[name]
         ret.get_type()  # Trigger an InvalidType check
         if ret.is_undefined():
             raise TileSyntaxError(f"Undefined variable {name} used")
         return ret
-    elif name in builder.scope.frozen_globals:
-        const_val = get_constant_value(builder.scope.frozen_globals[name])
+    elif name in scope.frozen_globals:
+        const_val = get_constant_value(scope.frozen_globals[name])
         return loosely_typed_const(const_val)
     else:
         raise TileSyntaxError(f"Undefined variable {name} used")

@@ -73,9 +73,9 @@ def global_compiler_lock(func):
     return wrapper
 
 
-def _get_final_ir(pyfunc, args, tile_context) -> ir.Block:
+def _get_final_ir(pyfunc, args, tile_context) -> ir.Function:
     ir_ctx = ir.IRContext(tile_context)
-    func_hir: hir.Function = get_function_hir(pyfunc, ir_ctx, entry_point=True)
+    func_hir: hir.Function = get_function_hir(pyfunc, entry_point=True)
 
     ir_args = _bind_kernel_arguments(func_hir.param_names, args, get_constant_annotations(pyfunc))
     func_body = hir2ir(func_hir, ir_args, ir_ctx)
@@ -94,7 +94,7 @@ def _get_final_ir(pyfunc, args, tile_context) -> ir.Block:
 
     split_loops(func_body)
     dead_code_elimination_pass(func_body)
-    return func_body
+    return ir.Function(func_body, func_hir.desc.name, func_hir.body.loc)
 
 
 def _bind_kernel_arguments(param_names: tuple[str, ...],
@@ -143,7 +143,7 @@ def _log_mlir(bytecode_buf):
     print(f"Lowering\n==== TILEIR MLIR module ====\n\n{text}", file=sys.stderr)
 
 
-def _compiler_crash_dump(func_body,
+def _compiler_crash_dump(func_ir: ir.Function,
                          bytecode_generator,
                          error_msg,
                          compiler_flags,
@@ -161,13 +161,13 @@ def _compiler_crash_dump(func_body,
         bytecode_generator(writer, anonymize_debug_attr=True)
 
     artifacts = {
-        f"{func_body.name}.bytecode": bytes(bytecode_buf),
-        f"{func_body.name}.cutileir": f"{func_body.to_string(include_loc=False)}\n",
+        f"{func_ir.name}.bytecode": bytes(bytecode_buf),
+        f"{func_ir.name}.cutileir": f"{func_ir.to_string(include_loc=False)}\n",
         "debug_info.txt": debug_info,
     }
 
     timestamp = datetime.datetime.now().timestamp()
-    zip_filename = os.path.abspath(f"crash_dump_{func_body.name}_{timestamp}.zip")
+    zip_filename = os.path.abspath(f"crash_dump_{func_ir.name}_{timestamp}.zip")
     print(f"Dumping crash artifacts to {zip_filename}\n", file=sys.stderr)
 
     with zipfile.ZipFile(zip_filename, "w") as z:
@@ -180,17 +180,17 @@ def compile_tile(pyfunc,
                  args,
                  compiler_options: CompilerOptions,
                  context: TileContext = default_tile_context) -> TileLibrary:
-    func_body = _get_final_ir(pyfunc, args, context)
+    func_ir = _get_final_ir(pyfunc, args, context)
 
     if 'CUTILEIR' in context.config.log_keys:
-        code = (f"==== CuTile IR for {func_body.name}==== \n\n"
-                f"{func_body.to_string(include_loc=False)}\n\n")
+        code = (f"==== CuTile IR for {func_ir.name}==== \n\n"
+                f"{func_ir.to_string(include_loc=False)}\n\n")
         print(f'\n{code}', file=sys.stderr)
 
     sm_arch = get_sm_arch()
 
     bytecode_generator = functools.partial(generate_bytecode_for_kernel,
-                                           func_body, compiler_options, sm_arch)
+                                           func_ir, compiler_options, sm_arch)
 
     bytecode_buf = bytearray()
     with bc.write_bytecode(num_functions=1, buf=bytecode_buf) as writer:
@@ -202,9 +202,9 @@ def compile_tile(pyfunc,
     if CUDA_TILE_DUMP_BYTECODE is not None:
         if not os.path.exists(CUDA_TILE_DUMP_BYTECODE):
             os.makedirs(CUDA_TILE_DUMP_BYTECODE)
-        base_filename = os.path.basename(func_body.loc.filename.split(".")[0])
+        base_filename = os.path.basename(func_ir.loc.filename.split(".")[0])
         path = os.path.join(CUDA_TILE_DUMP_BYTECODE,
-                            f"{base_filename}.ln{func_body.loc.line}.cutile")
+                            f"{base_filename}.ln{func_ir.loc.line}.cutile")
         print(f"Dumping TILEIR bytecode to file: {path}", file=sys.stderr)
         with open(path, "wb") as f:
             f.write(bytecode_buf)
@@ -216,9 +216,9 @@ def compile_tile(pyfunc,
             mlir_text = bytecode_to_mlir_text(bytecode_buf)
             if not os.path.exists(CUDA_TILE_DUMP_TILEIR):
                 os.makedirs(CUDA_TILE_DUMP_TILEIR)
-            base_filename = os.path.basename(func_body.loc.filename.split(".")[0])
+            base_filename = os.path.basename(func_ir.loc.filename.split(".")[0])
             path = os.path.join(
-                CUDA_TILE_DUMP_TILEIR, f"{base_filename}.ln{func_body.loc.line}.cuda_tile.mlir"
+                CUDA_TILE_DUMP_TILEIR, f"{base_filename}.ln{func_ir.loc.line}.cuda_tile.mlir"
             )
             print(f"Dumping TILEIR MLIR module to file:{path}", file=sys.stderr)
             with open(path, "w") as f:
@@ -228,7 +228,7 @@ def compile_tile(pyfunc,
                   "This is currently not a public feature.", file=sys.stderr)
 
     # Compile MLIR module and generate cubin
-    with tempfile.NamedTemporaryFile(suffix='.bytecode', prefix=func_body.name,
+    with tempfile.NamedTemporaryFile(suffix='.bytecode', prefix=func_ir.name,
                                      dir=context.config.temp_dir, delete=False) as f:
         f.write(bytecode_buf)
         f.flush()
@@ -238,12 +238,12 @@ def compile_tile(pyfunc,
                                        timeout_sec=context.config.compiler_timeout_sec)
         except TileCompilerError as e:
             if context.config.enable_crash_dump:
-                _compiler_crash_dump(func_body, bytecode_generator, e.message,
+                _compiler_crash_dump(func_ir, bytecode_generator, e.message,
                                      e.compiler_flags, e.compiler_version)
 
             raise e
 
-    return TileLibrary(func_body.name, cubin_file, bytecode_buf, func_body)
+    return TileLibrary(func_ir.name, cubin_file, bytecode_buf, func_ir.body)
 
 
 # Adapter between compile_tile() and kernel/TileDispatcher

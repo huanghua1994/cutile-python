@@ -15,19 +15,50 @@
 
 
 import enum
+import threading
 from dataclasses import dataclass
 from textwrap import indent
 from typing import Any, Set, Mapping
 
 from cuda.tile._exception import Loc, FunctionDesc
-from cuda.tile._ir.ir import Var
+
+
+@dataclass(frozen=True)
+class Value:
+    id: int
+
+    def __str__(self):
+        return f"%{self.id}"
+
+
+# Cache Value objects for reuse
+_value_cache = []
+_value_cache_lock = threading.Lock()
+
+
+def make_value(id: int) -> Value:
+    try:
+        # Fast path
+        return _value_cache[id]
+    except IndexError:
+        pass
+
+    if id >= 2000:
+        # Don't cache too many objects
+        return Value(id)
+
+    # Add 100 objects at a time to avoid triggering the slow path every time
+    with _value_cache_lock:
+        _value_cache.extend([Value(j) for j in range(len(_value_cache), id + 100)])
+    return _value_cache[id]
 
 
 # An "Operand" is a value that can be used as a function's argument, or as the function itself.
-# There are two kinds of Operands: variables and constants. Using a `Var` instance as an Operand
-# signals that this Operand is a variable, e.g. a result of a previous call or a kernel parameter.
-# An object of any other type means that it is an immediate constant.
-Operand = Var | Any
+# There are two kinds of Operands:
+#    - Using a `Value` instance as an Operand signals that this Operand is a result
+#      of a previous call, or a kernel parameter.
+#    - An object of any other type means that it is an immediate constant.
+Operand = Value | Any
 
 
 ModuleType = type(enum)
@@ -35,7 +66,7 @@ ModuleType = type(enum)
 
 @dataclass
 class Call:
-    results: tuple[Var, ...]
+    result: Value | None
     callee: Operand
     args: tuple[Operand, ...]
     kwargs: tuple[tuple[str, Operand], ...]
@@ -45,22 +76,14 @@ class Call:
         opfmt = _OperandFormatter([])
         loc_str = f"  # Line {self.loc.line}"
         if self.callee is identity:
-            return f"{_lhs_var_str(self.results[0])} = {opfmt(self.args[0])}{loc_str}"
+            return f"{self.result} = {opfmt(self.args[0])}{loc_str}"
+        lhs_str = "" if self.result is None else f"{self.result} = "
         callee_str = opfmt(self.callee)
-        results_str = ", ".join(_lhs_var_str(r) for r in self.results)
-        lhs_str = f"{results_str} = " if results_str else ""
         args_and_kwargs = (*(opfmt(a) for a in self.args),
                            *(f"{k}={opfmt(v)}" for k, v in self.kwargs))
         args_str = ", ".join(args_and_kwargs)
         blocks_str = "".join(indent(f"\n{b}", "    ") for b in opfmt.blocks)
         return f"{lhs_str}{callee_str}({args_str}){loc_str}{blocks_str}"
-
-
-def _lhs_var_str(var: Var):
-    ty = var.try_get_type()
-    if ty is None:
-        return var.name
-    return f"{var.name}: {ty}"
 
 
 class Jump(enum.Enum):
@@ -72,26 +95,27 @@ class Jump(enum.Enum):
 
 @dataclass
 class Block:
-    name: str
-    params: tuple[Var, ...]
+    block_id: int
+    params: tuple[Value, ...]
     calls: list[Call]
-    results: tuple[Operand, ...]
+    have_result: bool
+    result: Operand
     jump: Jump | None
     jump_loc: Loc
     stored_names: Set[str]
     loc: Loc
 
     def __str__(self):
-        params_str = ", ".join(p.name for p in self.params)
+        params_str = ", ".join(str(p) for p in self.params)
         calls_str = "".join(f"\n{c}" for c in self.calls)
         if self.jump is not None:
             calls_str += "\n" + self.jump_str()
         calls_str = indent(calls_str, "    ")
-        return f"^{self.name}({params_str}):{calls_str}"
+        return f"^{self.block_id}({params_str}):{calls_str}"
 
     def jump_str(self):
         opfmt = _OperandFormatter([])
-        results_str = ",".join(f" {opfmt(r)}" for r in self.results)
+        results_str = "" if self.result is None else opfmt(self.result)
         return f"{self.jump._value_}{results_str}  # Line {self.jump_loc.line}"
 
 
@@ -102,6 +126,7 @@ class Function:
     param_names: tuple[str, ...]
     param_locs: tuple[Loc, ...]
     frozen_globals: Mapping[str, Any]
+    value_id_upper_bound: int
 
 
 @dataclass
@@ -109,13 +134,13 @@ class _OperandFormatter:
     blocks: list["Block"]
 
     def __call__(self, x: Operand) -> str:
-        if isinstance(x, Var):
-            return x.name
+        if isinstance(x, Value):
+            return str(x)
         elif isinstance(x, ModuleType):
             return str(f"<mod:{x.__name__}>")
         elif isinstance(x, Block):
             self.blocks.append(x)
-            return f"^{x.name}"
+            return f"^{x.block_id}"
         elif callable(x):
             return f"<fn:{x.__name__}>"
         else:

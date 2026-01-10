@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 import enum
 import itertools
 import threading
@@ -16,11 +15,11 @@ from copy import copy
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import (
-    List, Optional, Dict, Tuple, Set, Any, TYPE_CHECKING, Sequence, Iterator
+    List, Optional, Dict, Tuple, Any, TYPE_CHECKING, Sequence, Iterator
 )
 from .type import Type, InvalidType
 from cuda.tile._exception import (
-    TileTypeError, Loc, TileInternalError, TileSyntaxError
+    TileTypeError, Loc, TileInternalError
 )
 from .._cext import TileContext
 
@@ -373,124 +372,10 @@ class LoopVarState:
                                 f" to {self.result_phi.ty} (line {self.result_phi.last_loc.line}")
 
 
-@dataclass
-class JumpInfo:
-    jump_op: Operation | None
-    outputs: tuple[Var, ...]
-
-
-@dataclass
-class ControlFlowInfo:
-    stored_names: tuple[str, ...]
-    flatten: bool = False
-    jumps: list[JumpInfo] = dataclasses.field(default_factory=list)
-
-
-@contextmanager
-def nested_block(name: str, loc: Loc, params: Sequence[Var] = (),
-                 loop_info: ControlFlowInfo | None = None,
-                 if_else_info: ControlFlowInfo | None = None):
-    prev_builder = Builder.get_current()
-    block = Block(prev_builder.ir_ctx, params=params, name=name, loc=loc)
-    new_loop_info = loop_info or prev_builder.loop_info
-    new_if_else_info = if_else_info or prev_builder.if_else_info
-    scope = prev_builder.scope
-    loc = loc.with_call_site(scope.call_site)
-    with Builder(prev_builder.ir_ctx, loc, scope, new_loop_info, new_if_else_info) as builder, \
-            scope.local.enter_branch():
-        yield block
-    block.extend(builder.ops)
-
-
-class LocalScope:
-    def __init__(self,
-                 all_locals: Set[str],
-                 ir_ctx: IRContext,
-                 parent: Optional["LocalScope"] = None):
-        self._all_locals = all_locals
-        self._ir_ctx = ir_ctx
-        self._map = dict()
-        self._parent = parent
-
-    def is_local_name(self, name: str):
-        current = self
-        while current is not None:
-            if name in current._all_locals:
-                return True
-            current = current._parent
-        return False
-
-    def redefine(self, name: str, loc: Loc) -> Var:
-        var = self._ir_ctx.make_var(name, loc)
-        self._map[name] = var
-        return var
-
-    def __getitem__(self, name: str):
-        var = self._lookup(name)
-        if var is None:
-            raise TileSyntaxError(f"Undefined variable {name} used")
-        return var
-
-    def get(self, name: str, loc: Loc):
-        var = self._lookup(name)
-        if var is None:
-            return self._ir_ctx.make_var(name, loc, undefined=True)
-        else:
-            return var
-
-    def _lookup(self, name: str) -> Optional[Var]:
-        seen = set()
-        current = self
-        while current is not None:
-            var = current._map.get(name)
-            if var is not None:
-                return var
-            # Sanity check, should not reach here.
-            if id(current) in seen:
-                raise RuntimeError("Cycle detected in Scope chain")
-            seen.add(id(current))
-            current = current._parent
-        return None
-
-    @contextmanager
-    def enter_branch(self):
-        old = self._map
-        self._map = _OverlayDict(old)
-        try:
-            yield
-        finally:
-            self._map = old
-
-
-class _OverlayDict:
-    def __init__(self, orig_dict: dict):
-        self._orig = orig_dict
-        self._overlay = dict()
-
-    def get(self, key):
-        value = self._overlay.get(key)
-        return self._orig.get(key) if value is None else value
-
-    def __setitem__(self, key, value):
-        self._overlay[key] = value
-
-
-@dataclass
-class Scope:
-    local: LocalScope
-    frozen_globals: Mapping[str, Any]
-    call_site: Loc | None
-
-
 class Builder:
-    def __init__(self, ctx: IRContext, loc: Loc, scope: Scope,
-                 loop_info: ControlFlowInfo | None = None,
-                 if_else_info: ControlFlowInfo | None = None):
+    def __init__(self, ctx: IRContext, loc: Loc):
         self.ir_ctx = ctx
-        self.scope = scope
         self.is_terminated = False
-        self.loop_info = loop_info
-        self.if_else_info = if_else_info
         self._loc = loc
         self._ops = []
         self._entered = False
@@ -578,33 +463,6 @@ class Builder:
         finally:
             self._loc = old_loc
 
-    @contextmanager
-    def change_if_else_info(self, new_info: ControlFlowInfo):
-        old = self.if_else_info
-        self.if_else_info = new_info
-        try:
-            yield
-        finally:
-            self.if_else_info = old
-
-    @contextmanager
-    def change_loop_info(self, new_info: ControlFlowInfo):
-        old = self.loop_info
-        self.loop_info = new_info
-        try:
-            yield
-        finally:
-            self.loop_info = old
-
-    @contextmanager
-    def change_scope(self, new_scope: Scope):
-        old = self.scope
-        self.scope = new_scope
-        try:
-            yield
-        finally:
-            self.scope = old
-
     def __enter__(self):
         assert not self._entered
         self._prev_builder = _current_builder.builder
@@ -617,6 +475,15 @@ class Builder:
         _current_builder.builder = self._prev_builder
         self._prev_builder = None
         self._entered = False
+
+
+@contextmanager
+def nested_block(loc: Loc):
+    prev_builder = Builder.get_current()
+    block = Block(prev_builder.ir_ctx, loc=loc)
+    with Builder(prev_builder.ir_ctx, loc) as builder:
+        yield block
+    block.extend(builder.ops)
 
 
 class _CurrentBuilder(threading.local):
@@ -658,9 +525,8 @@ class Operation:
     def _clone_impl(self, mapper: Mapper, result_vars: Sequence[Var]) -> Operation:
         new_nested_blocks = []
         for old_block in self.nested_blocks:
-            new_params = mapper.clone_vars(old_block.params)
-            new_name = old_block.ctx.make_var(f"^{old_block.name}", old_block.loc).name
-            new_block = Block(old_block.ctx, new_params, new_name, old_block.loc)
+            new_block = Block(old_block.ctx, old_block.loc)
+            new_block.params = mapper.clone_vars(old_block.params)
             for old_op in old_block:
                 new_block.append(old_op.clone(mapper))
             new_nested_blocks.append(new_block)
@@ -831,15 +697,14 @@ class TypedOperation(Operation):
 
 
 class Block:
-    def __init__(self, ctx: IRContext, params: Sequence[Var], name: str, loc: Loc):
+    def __init__(self, ctx: IRContext, loc: Loc):
         self.ctx = ctx
         self._operations: List[Operation] = []
-        self.params = tuple(params)
-        self.name = name
+        self.params = ()
         self.loc = loc
 
     def empty_like_self(self: "Block") -> "Block":
-        return Block(self.ctx, self.params, self.name, self.loc)
+        return Block(self.ctx, self.loc)
 
     def append(self, op: Operation):
         self._operations.append(op)
@@ -922,6 +787,13 @@ class Block:
 
     def __str__(self) -> str:
         return self.to_string()
+
+
+@dataclass
+class Function:
+    body: Block
+    name: str
+    loc: Loc
 
 
 @dataclass

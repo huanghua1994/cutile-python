@@ -13,7 +13,7 @@ from cuda.tile import DType, RoundingMode, PaddingMode
 import cuda.tile._bytecode as bc
 from cuda.tile._compiler_options import CompilerOptions
 from cuda.tile._exception import TileInternalError, TileError, FunctionDesc
-from cuda.tile._ir.ir import Block, Loc, Var, IRContext
+from cuda.tile._ir.ir import Block, Loc, Var, IRContext, Function
 from cuda.tile._ir.ops_utils import (
     padding_mode_to_bytecode, rounding_mode_to_bytecode,
     get_default_rounding_mode, get_dtype,
@@ -622,7 +622,7 @@ def generate_bytecode_for_block(ctx: BytecodeContext, block: Block):
                 raise TileInternalError(f"Internal error: {e}") from e
 
 
-def generate_bytecode_for_kernel(root_block: Block,
+def generate_bytecode_for_kernel(func_ir: Function,
                                  compiler_options: CompilerOptions,
                                  sm_arch: str,
                                  writer: bc.BytecodeWriter,
@@ -630,12 +630,13 @@ def generate_bytecode_for_kernel(root_block: Block,
     target_options = compiler_options.specialize_for_target(sm_arch)
     entry_hints = bc.EntryHints(num_cta_in_cga=target_options.num_ctas,
                                 occupancy=target_options.occupancy)
+    root_block = func_ir.body
 
     param_type_ids = [typeid(writer.type_table, p.get_type()) for p in root_block.params]
-    debug_attr_map = DebugAttrMap(writer.debug_attr_table, root_block.name, anonymize_debug_attr)
+    debug_attr_map = DebugAttrMap(writer.debug_attr_table, func_ir.name, anonymize_debug_attr)
     func_debug_attr = debug_attr_map.get_debugattr(root_block.loc)
 
-    with writer.function(name=root_block.name,
+    with writer.function(name=func_ir.name,
                          parameter_types=param_type_ids,
                          result_types=(),
                          entry_point=True,

@@ -11,10 +11,11 @@ from .. import TileTypeError
 from .._coroutine_util import resume_after, run_coroutine
 from .._exception import Loc, TileSyntaxError, TileInternalError, TileError, TileRecursionError
 from .._ir import hir, ir
-from .._ir.ir import Var, IRContext, Argument, Scope, LocalScope, BoundMethodValue
+from .._ir.ir import Var, IRContext, Argument, BoundMethodValue
 from .._ir.op_impl import op_implementations
-from .._ir.ops import loosely_typed_const, assign, end_branch, return_, continue_, \
+from .._ir.ops import loosely_typed_const, end_branch, return_, continue_, \
     break_, flatten_block_parameters, store_var
+from .._ir.scope import Scope, LocalScope, IntMap
 from .._ir.type import FunctionTy, BoundMethodTy, DTypeConstructor
 from .._ir.typing_support import get_signature
 
@@ -36,7 +37,7 @@ async def _hir2ir_coroutine(func_hir: hir.Function, args: tuple[Argument, ...], 
         for param_name, param_loc in zip(func_hir.param_names, func_hir.param_locs, strict=True)
     ]
 
-    with ir.Builder(ir_ctx, func_hir.body.loc, scope) as ir_builder:
+    with ir.Builder(ir_ctx, func_hir.body.loc) as ir_builder, scope.make_current():
         try:
             for param_name, var, arg in zip(func_hir.param_names, aggregate_params, args,
                                             strict=True):
@@ -55,15 +56,15 @@ async def _hir2ir_coroutine(func_hir: hir.Function, args: tuple[Argument, ...], 
                 print(f"==== Partial cuTile IR ====\n\n{ir_str}\n\n", file=sys.stderr)
             raise
 
-    all_flat_params = sum(flat_params, ())
-    ret = ir.Block(ir_ctx, all_flat_params, func_hir.body.name, func_hir.body.loc)
+    ret = ir.Block(ir_ctx, func_hir.body.loc)
+    ret.params = sum(flat_params, ())
     ret.extend(ir_builder.ops)
     return ret
 
 
 def _create_scope(func_hir: hir.Function, ir_ctx: IRContext, call_site: Loc | None) -> Scope:
     local_scope = LocalScope(func_hir.body.stored_names, ir_ctx)
-    return Scope(local_scope, func_hir.frozen_globals, call_site)
+    return Scope(local_scope, None, None, func_hir.frozen_globals, call_site, IntMap())
 
 
 async def dispatch_hir_block(block: hir.Block, cur_builder: ir.Builder | None = None):
@@ -75,20 +76,20 @@ async def dispatch_hir_block(block: hir.Block, cur_builder: ir.Builder | None = 
 async def _dispatch_hir_block_inner(block: hir.Block, builder: ir.Builder):
     cursor = 0  # Pre-initialize to guarantee it's defined in the `except` block
     try:
+        scope = Scope.get_current()
         for cursor, call in enumerate(block.calls):
-            loc = _add_call_site(call.loc, builder)
+            loc = call.loc.with_call_site(scope.call_site)
             with _wrap_exceptions(loc), builder.change_loc(loc):
-                await _dispatch_call(call, builder)
+                await _dispatch_call(call, builder, scope)
             if builder.is_terminated:
                 # The current block has been terminated, e.g. by flattening an if-else
                 # with a constant condition (`if True: break`).
                 return
         cursor = len(block.calls)
 
-        result_vars = tuple(_resolve_operand(x) for x in block.results)
-        loc = _add_call_site(block.jump_loc, builder)
+        loc = block.jump_loc.with_call_site(scope.call_site)
         with _wrap_exceptions(loc), builder.change_loc(loc):
-            _dispatch_hir_jump(block.jump, result_vars)
+            _dispatch_hir_jump(block, scope)
     except Exception:
         if 'CUTILEIR' in builder.ir_ctx.tile_ctx.config.log_keys:
             hir_params = ", ".join(p.name for p in block.params)
@@ -100,25 +101,20 @@ async def _dispatch_hir_block_inner(block: hir.Block, builder: ir.Builder):
         raise
 
 
-def _dispatch_hir_jump(jump: hir.Jump | None, block_results: tuple[Var, ...]):
-    match jump:
+def _dispatch_hir_jump(block: hir.Block, scope: Scope):
+    match block.jump:
         case hir.Jump.END_BRANCH:
-            end_branch(block_results)
+            end_branch(_resolve_operand(block.result, scope) if block.have_result else None)
         case hir.Jump.CONTINUE:
-            assert len(block_results) == 0
+            assert not block.have_result
             continue_()
         case hir.Jump.BREAK:
-            assert len(block_results) == 0
+            assert not block.have_result
             break_()
         case hir.Jump.RETURN:
-            assert len(block_results) == 1
-            return_(block_results[0])
+            return_(_resolve_operand(block.result, scope) if block.have_result else None)
         case None: pass
         case _: assert False
-
-
-def _add_call_site(loc: Loc, builder: ir.Builder) -> Loc:
-    return loc.with_call_site(builder.scope.call_site)
 
 
 @contextmanager
@@ -132,12 +128,11 @@ def _wrap_exceptions(loc: Loc):
             raise TileInternalError(str(e)) from e
 
 
-async def _dispatch_call(call: hir.Call, builder: ir.Builder):
-    first_idx = len(builder.ops)
-    callee_var = _resolve_operand(call.callee)
+async def _dispatch_call(call: hir.Call, builder: ir.Builder, scope: Scope):
+    callee_var = _resolve_operand(call.callee, scope)
     callee, self_arg = _get_callee_and_self(callee_var)
-    args = (*self_arg, *(_resolve_operand(x) for x in call.args))
-    kwargs = {k: _resolve_operand(v) for k, v in call.kwargs}
+    args = (*self_arg, *(_resolve_operand(x, scope) for x in call.args))
+    kwargs = {k: _resolve_operand(v, scope) for k, v in call.kwargs}
     arg_list = _bind_args(callee, args, kwargs)
 
     if callee in op_implementations:
@@ -151,31 +146,14 @@ async def _dispatch_call(call: hir.Call, builder: ir.Builder):
             # with a constant condition (`if True: break`). Ignore the `result` in this case.
             return
 
-        if result is None:
-            result = (loosely_typed_const(None),) if len(call.results) == 1 else ()
-        elif not isinstance(result, tuple):
-            result = (result,)
-
-        # Remap result variables
-        assert len(result) == len(call.results)
-        mapper = ir.Mapper(builder.ir_ctx, preserve_vars=True)
-        for impl_res, call_res in zip(result, call.results, strict=True):
-            builder.ir_ctx.copy_type_information(impl_res, call_res)
-            if _is_freshly_defined(impl_res, builder, first_idx):
-                # The result is a freshly defined variable.
-                # Replace it with the original variable.
-                mapper.set_var(impl_res, call_res)
-            else:
-                # The result is a pre-existing variable.
-                # This mainly happens when an operation implementation reduces to a no-op
-                # by returning its input. For example, `reshape(x, new_shape)` may return `x`
-                # when the new shape is the same as the old one. So we need to replace
-                # `y = reshape(x, new_shape)` with `y = assign(x)` to make sure `y` is defined.
-                assign(impl_res, call_res)
-
-        if not mapper.is_empty():
-            for i in range(first_idx, len(builder.ops)):
-                builder.ops[i] = builder.ops[i].clone(mapper)
+        # Map the result variable
+        if call.result is None:
+            assert result is None
+        else:
+            if result is None:
+                result = loosely_typed_const(None)
+            assert isinstance(result, Var)
+            scope.hir2ir_varmap[call.result.id] = result
     else:
         # Callee is a user-defined function.
         _check_recursive_call(builder.loc)
@@ -185,11 +163,11 @@ async def _dispatch_call(call: hir.Call, builder: ir.Builder):
                               inspect.Parameter.VAR_KEYWORD):
                 raise TileSyntaxError("Variadic parameters in user-defined"
                                       " functions are not supported")
-        callee_hir = get_function_hir(callee, builder.ir_ctx, entry_point=False)
+        callee_hir = get_function_hir(callee, entry_point=False)
 
         # Activate a fresh Scope.
         new_scope = _create_scope(callee_hir, builder.ir_ctx, call_site=builder.loc)
-        with builder.change_scope(new_scope):
+        with new_scope.make_current():
             # Call store_var() to bind arguments to parameters.
             for arg, param_name, param_loc in zip(arg_list, callee_hir.param_names,
                                                   callee_hir.param_locs, strict=True):
@@ -199,14 +177,9 @@ async def _dispatch_call(call: hir.Call, builder: ir.Builder):
             # and make sure we stay within the Python's recursion limit.
             await resume_after(dispatch_hir_block(callee_hir.body, builder))
 
-        for callee_retval, caller_res in zip(callee_hir.body.results, call.results):
-            assign(callee_retval, caller_res)
-
-
-def _is_freshly_defined(var: Var, builder: ir.Builder, first_idx: int):
-    return any(var.name == r.name
-               for i in range(first_idx, len(builder.ops))
-               for r in builder.ops[i].result_vars)
+        assert call.result is not None
+        assert callee_hir.body.have_result
+        scope.hir2ir_varmap[call.result.id] = new_scope.hir2ir_varmap[callee_hir.body.result.id]
 
 
 def _check_recursive_call(call_loc: Loc):
@@ -233,8 +206,10 @@ def _get_callee_and_self(callee_var: Var) -> tuple[Any, tuple[()] | tuple[Var]]:
         raise TileTypeError(f"Cannot call an object of type {callee_ty}")
 
 
-def _resolve_operand(x: hir.Operand) -> Var | hir.Block | Scope:
-    if isinstance(x, Var | hir.Block | Scope):
+def _resolve_operand(x: hir.Operand, scope: Scope) -> Var | hir.Block:
+    if isinstance(x, hir.Value):
+        return scope.hir2ir_varmap[x.id]
+    elif isinstance(x, hir.Block):
         return x
     else:
         return loosely_typed_const(x)

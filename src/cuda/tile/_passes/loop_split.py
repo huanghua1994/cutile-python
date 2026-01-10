@@ -134,10 +134,8 @@ def _clone_loop(loop: Loop, new_start: Var, new_stop: Var, new_step: Var,
                 initial_vars: tuple[Var, ...], result_vars: tuple[Var, ...],
                 if_ops_to_flatten: Set[IfElse], branch_to_keep: str, ctx: IRContext) -> Loop:
     mapper = Mapper(ctx)
-    new_params = mapper.clone_vars(loop.body.params)
-
-    new_name = ctx.make_var(f"^{loop.body.name}", loop.body.loc).name
-    new_body = Block(ctx, new_params, new_name, loop.body.loc)
+    new_body = Block(ctx, loop.body.loc)
+    new_body.params = mapper.clone_vars(loop.body.params)
     for body_op in loop.body:
         if isinstance(body_op, IfElse) and body_op in if_ops_to_flatten:
             early_continue = False
