@@ -15,10 +15,11 @@
 
 
 import enum
+import inspect
 import threading
 from dataclasses import dataclass
 from textwrap import indent
-from typing import Any, Set, Mapping
+from typing import Any, Set, OrderedDict
 
 from cuda.tile._exception import Loc, FunctionDesc
 
@@ -119,14 +120,80 @@ class Block:
         return f"{self.jump._value_}{results_str}  # Line {self.jump_loc.line}"
 
 
-@dataclass
+# Resolved position of a named variable.
+#
+# If `depth` is -1, then this is a global variable, and the `index`
+# points into `hir.Function.frozen_global_names` / `hir.Function.frozen_global_values`.
+# If both `depth` and `index` are -1, then this is an indication that no variable
+# with the given name has been found.
+#
+# If `depth` is non-negative but is less than the depth of the current function,
+# then this is a captured local variable of an enclosing function.
+# In this case, the local variable name can be found in
+# `hir.Function.enclosing_funcs[depth].local_names[index].
+#
+# If `depth` is equal to the depth of the current function, then this is a local variable.
+# In this case, the local variable name can be found in `hir.Function.local_names[index]`.
+@dataclass(frozen=True)
+class ResolvedName:
+    depth: int
+    index: int
+
+
+UNKNOWN_NAME = ResolvedName(-1, -1)
+
+
+@dataclass(eq=False, repr=False)
 class Function:
     desc: FunctionDesc
     body: Block
-    param_names: tuple[str, ...]
+
+    # For nested functions, this signature is synthesized from AST. In this case,
+    # default values of parameters are represented with ClosureDefaultPlaceholder objects.
+    signature: inspect.Signature
+
+    # Names of all local variables defined in this function.
+    local_names: tuple[str, ...]
+
+    # For each function parameter, an index into `local_names`
+    param_local_indices: tuple[int, ...]
+
+    # For each function parameter, its location (same length as `param_local_indices`)
     param_locs: tuple[Loc, ...]
-    frozen_globals: Mapping[str, Any]
+
+    # Names of all global-like variables accessible by this function.
+    frozen_global_names: tuple[str, ...]
+
+    # Values of all global-like variables access by this function.
+    # We assume that they don't change after compilation, hence the name "frozen".
+    # Same length as `frozen_global_names`.
+    frozen_global_values: tuple[Any, ...]
+
+    # Strict upper bound on hir.Value.id inside this function definition,
+    # excluding any nested functions. Can be used to pre-allocate lists etc.
     value_id_upper_bound: int
+
+    # List of all function definitions nested directly inside this function.
+    nested_functions: "tuple[Function, ...]"
+
+    # Names of all variables that are ever loaded by this function
+    loaded_names: tuple[str, ...]
+
+    # For each variable name used in this function (i.e. loaded from or stored to),
+    # its resolved position in the scope.
+    used_names: OrderedDict[str, ResolvedName]
+
+    # Pre-computed view of `used_names`: for each non-negative `depth` strictly less than this
+    # function's depth, the list of all local variable indices captured by this function.
+    # Empty when this is a top-level function.
+    captures_by_depth: tuple[tuple[int, ...], ...]
+
+    # Sequence of enclosing function definitions, outermost first.
+    # Empty when this is a top-level function.
+    enclosing_funcs: "tuple[Function, ...]"
+
+    def __repr__(self):
+        return f"<HIR for function {self.desc}>"
 
 
 @dataclass
@@ -157,3 +224,4 @@ def build_tuple(*items): ...  # Makes a tuple (i.e. returns `items`)
 def identity(x): ...   # Identity function (i.e. returns `x`)
 def store_var(name, value, /): ...  # Store into a named variable
 def load_var(name, /): ...  # Load from a named variable
+def make_closure(func_hir: Function, /, *default_values): ...

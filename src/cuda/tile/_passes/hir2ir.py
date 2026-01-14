@@ -11,14 +11,14 @@ from .. import TileTypeError
 from .._coroutine_util import resume_after, run_coroutine
 from .._exception import Loc, TileSyntaxError, TileInternalError, TileError, TileRecursionError
 from .._ir import hir, ir
-from .._ir.ir import Var, IRContext, Argument, BoundMethodValue
+from .._ir.ir import Var, IRContext, Argument, BoundMethodValue, ClosureValue
 from .._ir.op_impl import op_implementations
 from .._ir.ops import loosely_typed_const, end_branch, return_, continue_, \
     break_, flatten_block_parameters, store_var
 from .._ir.scope import Scope, LocalScope, IntMap
-from .._ir.type import FunctionTy, BoundMethodTy, DTypeConstructor
-from .._ir.typing_support import get_signature
-
+from .._ir.type import FunctionTy, BoundMethodTy, DTypeConstructor, ClosureTy, \
+    ClosureDefaultPlaceholder
+from .._ir.typing_support import get_signature, Closure
 
 MAX_RECURSION_DEPTH = 1000
 
@@ -31,20 +31,21 @@ def hir2ir(func_hir: hir.Function,
 
 
 async def _hir2ir_coroutine(func_hir: hir.Function, args: tuple[Argument, ...], ir_ctx: IRContext):
-    scope = _create_scope(func_hir, ir_ctx, call_site=None)
+    scope = _create_scope(func_hir, ir_ctx, call_site=None, parent_scopes=())
     aggregate_params = [
-        scope.local.redefine(param_name, param_loc)
-        for param_name, param_loc in zip(func_hir.param_names, func_hir.param_locs, strict=True)
+        scope.local.redefine(local_idx, param_loc)
+        for local_idx, param_loc
+        in zip(func_hir.param_local_indices, func_hir.param_locs, strict=True)
     ]
 
     with ir.Builder(ir_ctx, func_hir.body.loc) as ir_builder, scope.make_current():
         try:
-            for param_name, var, arg in zip(func_hir.param_names, aggregate_params, args,
-                                            strict=True):
+            for local_idx, var, arg in zip(func_hir.param_local_indices, aggregate_params, args,
+                                           strict=True):
                 var.set_type(arg.type)
                 if arg.is_const:
                     var = loosely_typed_const(arg.const_value)
-                    store_var(param_name, var, var.loc)
+                    store_var(local_idx, var, var.loc)
             flat_params = flatten_block_parameters(aggregate_params)
 
             await _dispatch_hir_block_inner(func_hir.body, ir_builder)
@@ -62,9 +63,10 @@ async def _hir2ir_coroutine(func_hir: hir.Function, args: tuple[Argument, ...], 
     return ret
 
 
-def _create_scope(func_hir: hir.Function, ir_ctx: IRContext, call_site: Loc | None) -> Scope:
-    local_scope = LocalScope(func_hir.body.stored_names, ir_ctx)
-    return Scope(local_scope, None, None, func_hir.frozen_globals, call_site, IntMap())
+def _create_scope(func_hir: hir.Function, ir_ctx: IRContext, call_site: Loc | None,
+                  parent_scopes: tuple[LocalScope, ...]) -> Scope:
+    local_scope = LocalScope(func_hir.local_names, ir_ctx)
+    return Scope(parent_scopes + (local_scope,), None, None, call_site, IntMap(), func_hir)
 
 
 async def dispatch_hir_block(block: hir.Block, cur_builder: ir.Builder | None = None):
@@ -157,21 +159,27 @@ async def _dispatch_call(call: hir.Call, builder: ir.Builder, scope: Scope):
     else:
         # Callee is a user-defined function.
         _check_recursive_call(builder.loc)
-        sig = get_signature(callee)
-        for param_name, param in sig.parameters.items():
+        if isinstance(callee, Closure):
+            callee_hir = callee.ty.func_hir
+            parent_scopes = _get_closure_parent_scopes(callee, builder.ir_ctx)
+        else:
+            callee_hir = get_function_hir(callee, entry_point=False)
+            parent_scopes = ()
+
+        for param_name, param in callee_hir.signature.parameters.items():
             if param.kind in (inspect.Parameter.VAR_POSITIONAL,
                               inspect.Parameter.VAR_KEYWORD):
                 raise TileSyntaxError("Variadic parameters in user-defined"
                                       " functions are not supported")
-        callee_hir = get_function_hir(callee, entry_point=False)
 
         # Activate a fresh Scope.
-        new_scope = _create_scope(callee_hir, builder.ir_ctx, call_site=builder.loc)
+        new_scope = _create_scope(callee_hir, builder.ir_ctx, call_site=builder.loc,
+                                  parent_scopes=parent_scopes)
         with new_scope.make_current():
             # Call store_var() to bind arguments to parameters.
-            for arg, param_name, param_loc in zip(arg_list, callee_hir.param_names,
-                                                  callee_hir.param_locs, strict=True):
-                store_var(param_name, arg, param_loc)
+            for arg, local_idx, param_loc in zip(arg_list, callee_hir.param_local_indices,
+                                                 callee_hir.param_locs, strict=True):
+                store_var(local_idx, arg, param_loc)
 
             # Dispatch the function body. Use resume_after() to break the call stack
             # and make sure we stay within the Python's recursion limit.
@@ -179,7 +187,91 @@ async def _dispatch_call(call: hir.Call, builder: ir.Builder, scope: Scope):
 
         assert call.result is not None
         assert callee_hir.body.have_result
-        scope.hir2ir_varmap[call.result.id] = new_scope.hir2ir_varmap[callee_hir.body.result.id]
+        scope.hir2ir_varmap[call.result.id] = _process_return_value(
+                new_scope.hir2ir_varmap[callee_hir.body.result.id], new_scope.local, builder)
+        new_scope.local.mark_dead()
+
+
+def _get_closure_parent_scopes(closure: Closure, ir_ctx: IRContext) -> tuple[LocalScope, ...]:
+    ret: list[LocalScope | None] = [None for _ in closure.ty.frozen_capture_types_by_depth]
+    for live_scope in closure.ty.captured_scopes:
+        ret[live_scope.depth] = live_scope.local_scope
+
+    for depth, (func, frozen_local_indices, frozen_vars) in enumerate(
+                zip(closure.ty.func_hir.enclosing_funcs,
+                    closure.ty.func_hir.captures_by_depth,
+                    closure.val.frozen_captures_by_depth,
+                    strict=True)):
+        # Scope at this depth is either live or frozen (mutually exclusive)
+        assert (frozen_vars is None) != (ret[depth] is None)
+        if frozen_vars is not None:
+            ret[depth] = LocalScope.create_frozen(func.local_names, frozen_local_indices,
+                                                  frozen_vars, ir_ctx)
+    return tuple(ret)
+
+
+def _process_return_value(retval: Var, callee_scope: LocalScope, builder: ir.Builder) -> Var:
+    ty = retval.get_type_allow_invalid()
+    if not ty.is_aggregate():
+        return retval
+
+    if isinstance(ty, ClosureTy):
+        retval = _freeze_returned_closure(retval, callee_scope, builder)
+        ty = retval.get_type()
+
+    old_items = retval.get_aggregate().as_tuple()
+    new_items = tuple(_process_return_value(x, callee_scope, builder) for x in old_items)
+    if any(old is not new for old, new in zip(old_items, new_items, strict=True)):
+        new_agg_val = ty.make_aggregate_value(new_items)
+        retval = builder.make_aggregate(new_agg_val, ty)
+
+    return retval
+
+
+def _freeze_returned_closure(retval: Var, callee_scope: LocalScope, builder: ir.Builder) -> Var:
+    ty = retval.get_type_allow_invalid()
+    assert isinstance(ty, ClosureTy)
+
+    if len(ty.captured_scopes) == 0 or ty.captured_scopes[-1].local_scope is not callee_scope:
+        # For example:
+        #
+        #    def kernel():
+        #        def f1():
+        #            ...
+        #        def f2(x):
+        #            return x  # <--at this return
+        #        f2(f1)
+        #
+        # Note that for f1, `ty.captured_scopes[-1].local_scope` is the live scope of `kernel()`.
+        # But when we return from `f2()`, the `callee_scope` is the scope of `f2`, so there
+        # is nothing to freeze in this case.
+        return retval
+
+    closure_val = retval.get_aggregate()
+    assert isinstance(closure_val, ClosureValue)
+
+    depth = ty.captured_scopes[-1].depth
+    frozen_locals = ty.func_hir.captures_by_depth[depth]
+    frozen_captures = tuple(callee_scope.get(idx, builder.loc) for idx in frozen_locals)
+    frozen_capture_types = tuple(v.get_type_allow_invalid() for v in frozen_captures)
+
+    new_closure_val = ClosureValue(
+        default_values=closure_val.default_values,
+        frozen_captures_by_depth=_replace_tuple_item(
+            closure_val.frozen_captures_by_depth, depth, frozen_captures)
+    )
+    new_ty = ClosureTy(
+        func_hir=ty.func_hir,
+        default_value_types=ty.default_value_types,
+        captured_scopes=ty.captured_scopes[:-1],
+        frozen_capture_types_by_depth=_replace_tuple_item(
+            ty.frozen_capture_types_by_depth, depth, frozen_capture_types)
+    )
+    return builder.make_aggregate(new_closure_val, new_ty)
+
+
+def _replace_tuple_item(tup, idx, val):
+    return tup[:idx] + (val,) + tup[idx+1:]
 
 
 def _check_recursive_call(call_loc: Loc):
@@ -202,14 +294,16 @@ def _get_callee_and_self(callee_var: Var) -> tuple[Any, tuple[()] | tuple[Var]]:
         return callee_ty.func, (bound_method.bound_self,)
     elif isinstance(callee_ty, DTypeConstructor):
         return callee_ty.dtype, ()
+    elif isinstance(callee_ty, ClosureTy):
+        return Closure(callee_ty, callee_var.get_aggregate()), ()
     else:
         raise TileTypeError(f"Cannot call an object of type {callee_ty}")
 
 
-def _resolve_operand(x: hir.Operand, scope: Scope) -> Var | hir.Block:
+def _resolve_operand(x: hir.Operand, scope: Scope) -> Var | hir.Block | hir.Function:
     if isinstance(x, hir.Value):
         return scope.hir2ir_varmap[x.id]
-    elif isinstance(x, hir.Block):
+    elif isinstance(x, hir.Block | hir.Function):
         return x
     else:
         return loosely_typed_const(x)
@@ -229,5 +323,10 @@ def _bind_args(sig_func, args, kwargs) -> list[Var]:
             ret.append(())
         else:
             assert param.default is not param.empty
-            ret.append(loosely_typed_const(param.default))
+            if isinstance(param.default, ClosureDefaultPlaceholder):
+                assert isinstance(sig_func, Closure)
+                default = sig_func.val.default_values[param.default.default_value_index]
+            else:
+                default = loosely_typed_const(param.default)
+            ret.append(default)
     return ret

@@ -20,7 +20,7 @@ from cuda.tile._ir.ir import (
     has_side_effects, terminator, add_operation, TypedOperation, Builder,
     has_multiple_results, nested_block, PhiState, LoopVarState,
     TupleValue, make_aggregate, RangeValue, BoundMethodValue, ArrayValue, ConstantState,
-    ListValue
+    ListValue, ClosureValue
 )
 from cuda.tile._ir.load_store_impl import (
     check_load_store_hints,
@@ -28,6 +28,7 @@ from cuda.tile._ir.load_store_impl import (
     load_pointer_lowering, store_pointer_lowering,
 )
 from . import hir
+from .hir import ResolvedName
 from .op_impl import (
     impl, require_constant_int, require_constant_int_tuple,
     require_signed_integer_scalar_or_0d_tile_type,
@@ -54,7 +55,7 @@ from .type import (
     TupleTy, TileTy, NoneType, BoundMethodTy, SizeTy, ArrayTy,
     ListTy, make_tile_ty, SliceType, DTypeConstructor, RangeIterType, Type,
     NONE, ModuleTy, TypeTy, LooselyTypedScalar, DTypeSpec, StringTy, InvalidType,
-    array_size_type,
+    array_size_type, ClosureTy, LiveCapturedScope
 )
 from cuda.tile._datatype import (
     DType, is_integral, is_float, is_signed, is_boolean, is_restricted_float,
@@ -181,11 +182,11 @@ async def loop_impl(body: hir.Block, iterable: Var):
         return
 
     builder = Builder.get_current()
-    stored_names = tuple(sorted(body.stored_names))
+    stored_locals = tuple(sorted(scope.get_local_index(name) for name in body.stored_names))
     var_states = tuple(LoopVarState(PhiState(initial_constant_state=ConstantState.NONCONSTANT),
                                     PhiState())
-                       for _ in stored_names)
-    initial_values = tuple(scope.local.get(name, builder.loc) for name in stored_names)
+                       for _ in stored_locals)
+    initial_values = tuple(scope.local.get(index, builder.loc) for index in stored_locals)
     body_params = []
 
     # Logic specific to `for` loops:
@@ -201,17 +202,17 @@ async def loop_impl(body: hir.Block, iterable: Var):
         body_params.append(induction_var)
 
     # Process the loop body
-    loop_info = ControlFlowInfo(stored_names)
+    loop_info = ControlFlowInfo(stored_locals)
     body_loc = body.loc.with_call_site(scope.call_site)
     with nested_block(body_loc) as new_body, scope.change_loop_info(loop_info), \
             scope.local.enter_branch():
         # Define body variables. Not all of them will eventually be kept,
         # so we don't set the block parameters yet.
         body_vars = []
-        for name, initial_var, state in zip(
-                stored_names, initial_values, var_states, strict=True):
+        for local_idx, initial_var, state in zip(
+                stored_locals, initial_values, var_states, strict=True):
             state.body_phi.propagate(initial_var, allow_loose_typing=False)
-            body_var = scope.local.redefine(name, state.body_phi.last_loc)
+            body_var = scope.local.redefine(local_idx, state.body_phi.last_loc)
             body_var.set_type(state.body_phi.ty)
             body_vars.append(body_var)
 
@@ -297,19 +298,21 @@ async def loop_impl(body: hir.Block, iterable: Var):
     # Finalize the scope & type information for valid result variables
     valid_var_states = tuple(s for s, is_valid in zip(var_states, mask, strict=True)
                              if is_valid)
-    valid_stored_names = tuple(n for n, is_valid in zip(stored_names, mask, strict=True)
-                               if is_valid)
-    for res, state, name in zip(result_vars, valid_var_states, valid_stored_names, strict=True):
+    valid_stored_locals = tuple(local_idx
+                                for local_idx, is_valid in zip(stored_locals, mask, strict=True)
+                                if is_valid)
+    for res, state, local_idx in zip(result_vars, valid_var_states, valid_stored_locals,
+                                     strict=True):
         state.result_phi.finalize_constant_and_loose_type(res)
-        store_var(name, res, state.result_phi.last_loc)
+        store_var(local_idx, res, state.result_phi.last_loc)
 
     # For any names that are stored within the loop body but have an invalid result type,
     # we update the scope to point to an undefined variable of this invalid type, so that
     # using that variable afterwards would result in a type error.
-    for body_var, state, name, is_valid in zip(body_vars, var_states, stored_names, mask,
-                                               strict=True):
+    for body_var, state, local_idx, is_valid in zip(body_vars, var_states, stored_locals, mask,
+                                                    strict=True):
         if not is_valid:
-            store_undefined(name, body_var.get_type_allow_invalid(), state.result_phi.last_loc)
+            store_undefined(local_idx, body_var.get_type_allow_invalid(), state.result_phi.last_loc)
 
 
 def _have_nested_jump(calls: Sequence[hir.Call]) -> bool:
@@ -393,12 +396,13 @@ async def if_else_impl(cond: Var, then_block: hir.Block, else_block: hir.Block) 
         return await _flatten_branch(branch_taken)
 
     # Get the total number of results by adding the number of stored variables.
-    # Note: we sort the stored variable names to make the order deterministic.
-    stored_names = tuple(sorted(then_block.stored_names | else_block.stored_names))
+    # Note: we sort the stored variable indices to make the order deterministic.
+    scope = Scope.get_current()
+    stored_locals = tuple(sorted(scope.get_local_index(name)
+                                 for name in (then_block.stored_names | else_block.stored_names)))
 
     # Convert the "then" branch from HIR to IR
-    info = ControlFlowInfo(stored_names)
-    scope = Scope.get_current()
+    info = ControlFlowInfo(stored_locals)
     then_loc = then_block.loc.with_call_site(scope.call_site)
     with nested_block(then_loc) as new_then_block, scope.change_if_else_info(info), \
             scope.local.enter_branch():
@@ -462,7 +466,7 @@ async def if_else_impl(cond: Var, then_block: hir.Block, else_block: hir.Block) 
     builder = Builder.get_current()
 
     # Get/create variables for the explicit result
-    num_explicit_results = num_results - len(stored_names)
+    num_explicit_results = num_results - len(stored_locals)
     if num_explicit_results == 0:
         ret = None
     else:
@@ -472,12 +476,13 @@ async def if_else_impl(cond: Var, then_block: hir.Block, else_block: hir.Block) 
             ret = builder.ir_ctx.make_temp(builder.loc, undefined=True)
 
     # Update the scope for stored named
-    for res_var, phi, name in zip(all_results[num_explicit_results:],
-                                  result_phis[num_explicit_results:], stored_names, strict=True):
+    for res_var, phi, local_idx in zip(all_results[num_explicit_results:],
+                                       result_phis[num_explicit_results:],
+                                       stored_locals, strict=True):
         if res_var is None:
-            store_undefined(name, phi.ty, phi.last_loc)
+            store_undefined(local_idx, phi.ty, phi.last_loc)
         else:
-            store_var(name, res_var, phi.last_loc)
+            store_var(local_idx, res_var, phi.last_loc)
 
     return ret
 
@@ -514,7 +519,7 @@ def continue_():
     builder = Builder.get_current()
     builder.add_operation(Continue, (), dict(values=()))
     op = builder.ops[-1]
-    next_values = tuple(scope.local.get(name, builder.loc) for name in info.stored_names)
+    next_values = tuple(scope.local.get(local_idx, builder.loc) for local_idx in info.stored_locals)
     info.jumps.append(JumpInfo(op, next_values))
 
 
@@ -554,8 +559,7 @@ def break_():
     builder = Builder.get_current()
     builder.add_operation(Break, (), dict(values=()))
     op = builder.ops[-1]
-    outputs = tuple(scope.local.get(name, builder.loc)
-                    for name in info.stored_names)
+    outputs = tuple(scope.local.get(local_idx, builder.loc) for local_idx in info.stored_locals)
     info.jumps.append(JumpInfo(op, outputs))
 
 
@@ -590,8 +594,8 @@ def end_branch(output: Var | None):
         builder = Builder.get_current()
         builder.add_operation(EndBranch, (), dict(outputs=()))
         op = builder.ops[-1]
-        outputs += tuple(scope.local.get(name, builder.loc)
-                         for name in info.stored_names)
+        outputs += tuple(scope.local.get(local_idx, builder.loc)
+                         for local_idx in info.stored_locals)
     info.jumps.append(JumpInfo(op, outputs))
 
 
@@ -3622,17 +3626,15 @@ def tile_item(tile: Var) -> Var:
     return add_operation(TileItem, x_ty.dtype, x=tile)
 
 
-def store_var(name: str, value: Var, loc: Loc | None = None):
-    local_scope = Scope.get_current().local
-    assert local_scope.is_local_name(name)
-    new_var = local_scope.redefine(name, loc or Builder.get_current().loc)
+def store_var(local_idx: int, value: Var, loc: Loc | None = None):
+    scope = Scope.get_current()
+    new_var = scope.local.redefine(local_idx, loc or Builder.get_current().loc)
     assign(value, new_var)
 
 
-def store_undefined(name: str, ty: Type, loc: Loc | None = None):
-    local_scope = Scope.get_current().local
-    assert local_scope.is_local_name(name)
-    new_var = local_scope.redefine(name, loc or Builder.get_current().loc)
+def store_undefined(local_idx: int, ty: Type, loc: Loc | None = None):
+    scope = Scope.get_current()
+    new_var = scope.local.redefine(local_idx, loc or Builder.get_current().loc)
     new_var.set_undefined()
     new_var.set_type(ty)
 
@@ -3640,25 +3642,56 @@ def store_undefined(name: str, ty: Type, loc: Loc | None = None):
 @impl(hir.store_var)
 def store_var_impl(name: Var, value: Var):
     name = require_constant_str(name)
-    store_var(name, value)
+    scope = Scope.get_current()
+    index = scope.get_local_index(name)
+    store_var(index, value)
 
 
 @impl(hir.load_var)
 def load_var_impl(name):
     name = require_constant_str(name)
     scope = Scope.get_current()
-    local_scope = scope.local
-    if local_scope.is_local_name(name):
-        ret = local_scope[name]
+    rn: ResolvedName = scope.func_hir.used_names[name]
+    if rn.depth >= 0:
+        ret = scope.local_scopes[rn.depth][rn.index]
         ret.get_type()  # Trigger an InvalidType check
         if ret.is_undefined():
             raise TileSyntaxError(f"Undefined variable {name} used")
         return ret
-    elif name in scope.frozen_globals:
-        const_val = get_constant_value(scope.frozen_globals[name])
-        return loosely_typed_const(const_val)
+    elif rn.index >= 0:
+        val = scope.func_hir.frozen_global_values[rn.index]
+        val = get_constant_value(val)
+        return loosely_typed_const(val)
     else:
         raise TileSyntaxError(f"Undefined variable {name} used")
+
+
+@impl(hir.make_closure)
+def make_closure_impl(func_hir: hir.Function, default_values: tuple[Var, ...]):
+    default_value_types = tuple(v.get_type() for v in default_values)
+
+    frozen_captures_by_depth = []
+    frozen_capture_types_by_depth = []
+    captured_scopes = []
+
+    builder = Builder.get_current()
+    scope = Scope.get_current()
+    for depth, (local_scope, captured_indices) in (enumerate(
+                zip(scope.local_scopes, func_hir.captures_by_depth, strict=True))):
+        if local_scope.frozen:
+            frozen_vars = tuple(local_scope.get(idx, builder.loc) for idx in captured_indices)
+            frozen_captures_by_depth.append(frozen_vars)
+            frozen_types = tuple(v.get_type_allow_invalid() for v in frozen_vars)
+            frozen_capture_types_by_depth.append(frozen_types)
+        else:
+            captured_scopes.append(LiveCapturedScope(depth, local_scope))
+            frozen_captures_by_depth.append(None)
+            frozen_capture_types_by_depth.append(None)
+
+    closure_ty = ClosureTy(func_hir, default_value_types, tuple(captured_scopes),
+                           tuple(frozen_capture_types_by_depth))
+    closure_val = ClosureValue(default_values, tuple(frozen_captures_by_depth))
+    return make_aggregate(closure_val, closure_ty)
 
 
 LoadMemoryOperation = TileLoad | LoadPointer

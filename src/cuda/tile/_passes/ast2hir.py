@@ -9,12 +9,13 @@ import operator
 from contextlib import contextmanager
 from enum import Enum, auto
 from functools import lru_cache
-from typing import List, Sequence, Optional, Any, Dict, Type, Callable
+from typing import List, Sequence, Optional, Any, Dict, Type, Callable, OrderedDict
 
 from cuda.tile import _datatype as datatype
 from cuda.tile._exception import TileSyntaxError, Loc, FunctionDesc
-from cuda.tile._ir.hir import make_value
+from cuda.tile._ir.hir import make_value, ResolvedName, UNKNOWN_NAME
 from cuda.tile._ir import hir
+from cuda.tile._ir.type import ClosureDefaultPlaceholder
 
 
 @lru_cache
@@ -59,15 +60,66 @@ def get_function_hir(pyfunc: Callable, entry_point: bool) -> hir.Function:
 
     filename = inspect.getfile(pyfunc)
     desc = FunctionDesc(func_def.name, filename, first_line)
-    ctx = _Context(filename, first_line, desc, entry_point)
-    assert isinstance(func_def, ast.FunctionDef)
+    frozen_global_names = tuple(sorted(func_globals.keys()))
+    frozen_global_values = tuple(func_globals[name] for name in frozen_global_names)
+    ctx = _Context(filename, first_line, desc, frozen_global_names, frozen_global_values,
+                   entry_point)
+    signature = inspect.signature(pyfunc)
+    ret = _get_function_hir_inner(func_def, signature, ctx)
+
+    resolved_names = {name: ResolvedName(-1, i) for i, name in enumerate(frozen_global_names)}
+    _finalize_func(ret, resolved_names, 0, ())
+    return ret
+
+
+def _finalize_func(func: hir.Function, resolved_names: dict[str, ResolvedName], depth: int,
+                   enclosing_functions: tuple[hir.Function, ...]):
+    resolved_names = dict(resolved_names)
+    for i, name in enumerate(func.local_names):
+        resolved_names[name] = ResolvedName(depth, i)
+
+    all_used_names = set(func.loaded_names + func.local_names)
+    new_enclosing_functions = enclosing_functions + (func,)
+    for nested_func in func.nested_functions:
+        _finalize_func(nested_func, resolved_names, depth + 1, new_enclosing_functions)
+        for name, rn in nested_func.used_names.items():
+            if rn.depth <= depth:
+                all_used_names.add(name)
+
+    captures_by_depth = tuple([] for _ in range(depth))
+    for name in sorted(all_used_names):
+        rn = resolved_names.get(name, UNKNOWN_NAME)
+        func.used_names[name] = rn
+        if 0 <= rn.depth < depth:
+            captures_by_depth[rn.depth].append(rn.index)
+    func.captures_by_depth = tuple(tuple(lst) for lst in captures_by_depth)
+    func.enclosing_funcs = enclosing_functions
+
+
+def _get_function_hir_inner(func_def: ast.FunctionDef | ast.Lambda, signature: inspect.Signature,
+                            ctx: "_Context") -> hir.Function:
+    assert isinstance(func_def, ast.FunctionDef | ast.Lambda)
     body = _ast2hir(func_def, ctx)
     all_ast_args = _get_all_parameters(func_def, ctx)
     param_names = tuple(p.arg for p in all_ast_args)
-    param_locs = tuple(ctx.get_loc(p) for p in all_ast_args)
     body.stored_names.update(param_names)
-    value_id_upper_bound = next(ctx.value_id_sequence)
-    return hir.Function(desc, body, param_names, param_locs, func_globals, value_id_upper_bound)
+    local_names = tuple(sorted(body.stored_names))
+    return hir.Function(
+        desc=ctx.function_desc,
+        body=body,
+        signature=signature,
+        local_names=local_names,
+        param_local_indices=tuple(local_names.index(name) for name in param_names),
+        param_locs=tuple(ctx.get_loc(p) for p in all_ast_args),
+        frozen_global_names=ctx.frozen_global_names,
+        frozen_global_values=ctx.frozen_global_values,
+        value_id_upper_bound=next(ctx.value_id_sequence),
+        nested_functions=tuple(ctx.nested_functions),
+        loaded_names=tuple(sorted(ctx.loaded_names)),
+        used_names=OrderedDict(),  # to be filled later
+        captures_by_depth=(),  # to be filled later
+        enclosing_funcs=(),  # to be filled later
+    )
 
 
 # Translate the 1-based line number of the chunk we passed to the AST parser
@@ -86,16 +138,21 @@ class LoopKind(Enum):
 
 class _Context:
     def __init__(self, filename: str, first_line: int, function_desc: FunctionDesc,
+                 frozen_global_names: tuple[str, ...], frozen_global_values: tuple[Any, ...],
                  entry_point: bool):
         self.filename = filename
         self.first_line = first_line
         self.function_desc = function_desc
+        self.frozen_global_names = frozen_global_names
+        self.frozen_global_values = frozen_global_values
         self.entry_point = entry_point
         self.parent_loops: List[LoopKind] = []
         self.current_loc = Loc.unknown()
         self.current_block: Optional[hir.Block] = None
         self.value_id_sequence = itertools.count()
         self.block_id_sequence = itertools.count()
+        self.nested_functions = []
+        self.loaded_names = set()
 
     def make_value(self) -> hir.Value:
         return make_value(next(self.value_id_sequence))
@@ -148,6 +205,7 @@ class _Context:
         self.current_block.stored_names.add(var_name)
 
     def load(self, var_name: str) -> hir.Value:
+        self.loaded_names.add(var_name)
         return self.call(hir.load_var, (var_name,))
 
     def get_loc(self, node: ast.AST) -> Loc:
@@ -304,11 +362,16 @@ def _subscript_expr(subscript: ast.Subscript, ctx: _Context) -> hir.Value:
 
 
 @_register(_expr_handlers, ast.Slice)
-def _slice_stmt(slice_: ast.Slice, ctx: _Context) -> hir.Value:
+def _slice_expr(slice_: ast.Slice, ctx: _Context) -> hir.Value:
     def get_var(x: ast.AST | None):
         return None if x is None else _expr(x, ctx)
     lower, upper, step = map(get_var, (slice_.lower, slice_.upper, slice_.step))
     return ctx.call(slice, (lower, upper, step))
+
+
+@_register(_expr_handlers, ast.Lambda)
+def _lambda_expr(lamb: ast.Lambda, ctx: _Context) -> hir.Value:
+    return _make_closure(lamb, ctx)
 
 
 def _unsupported_expr(expr: ast.AST, ctx: _Context):
@@ -564,6 +627,70 @@ def _pass_stmt(stmt: ast.Pass, ctx: _Context) -> None:
     pass
 
 
+def _make_closure(node: ast.FunctionDef | ast.Lambda, ctx: _Context) -> hir.Value:
+    signature, default_exprs = _signature_from_ast_arguments(node.args)
+    default_values = tuple(_expr(x, ctx) for x in default_exprs)
+    line_no = _get_source_line_no(ctx.first_line, node.lineno)
+    name = None if isinstance(node, ast.Lambda) else node.name
+    desc = FunctionDesc(name, ctx.filename, line_no)
+    new_ctx = _Context(ctx.filename, ctx.first_line, desc, ctx.frozen_global_names,
+                       ctx.frozen_global_values, entry_point=False)
+
+    func_hir = _get_function_hir_inner(node, signature, new_ctx)
+    ctx.nested_functions.append(func_hir)
+    return ctx.call(hir.make_closure, (func_hir, *default_values))
+
+
+@_register(_stmt_handlers, ast.FunctionDef)
+def _function_def_stmt(stmt: ast.FunctionDef, ctx: _Context) -> None:
+    if len(stmt.decorator_list) > 0:
+        raise ctx.syntax_error("Decorators on nested functions are not supported")
+
+    closure = _make_closure(stmt, ctx)
+    ctx.store(stmt.name, closure)
+
+
+def _signature_from_ast_arguments(aa: ast.arguments) \
+        -> tuple[inspect.Signature, list[ast.expr]]:
+    def make_default_placeholder(default_expr: ast.expr) -> ClosureDefaultPlaceholder:
+        ret = ClosureDefaultPlaceholder(len(all_default_exprs))
+        all_default_exprs.append(default_expr)
+        return ret
+
+    all_default_exprs: list[ast.expr] = []
+    all_params = []
+    for p in aa.posonlyargs:
+        all_params.append((p, inspect.Parameter.POSITIONAL_ONLY))
+    for p in aa.args:
+        all_params.append((p, inspect.Parameter.POSITIONAL_OR_KEYWORD))
+
+    # Defaults for POSITIONAL_ONLY & POSITIONAL_OR_KEYWORD
+    num_pos_params = len(all_params)
+    defaults: list[Any] = [inspect.Parameter.empty] * (num_pos_params - len(aa.defaults))
+    for def_expr in aa.defaults:
+        defaults.append(make_default_placeholder(def_expr))
+
+    # *args
+    if aa.vararg is not None:
+        all_params.append((aa.vararg, inspect.Parameter.VAR_POSITIONAL))
+        defaults.append(inspect.Parameter.empty)
+
+    # Keyword-only parameters
+    for p, def_expr in zip(aa.kwonlyargs, aa.kw_defaults, strict=True):
+        all_params.append((p, inspect.Parameter.KEYWORD_ONLY))
+        defaults.append(inspect.Parameter.empty if def_expr is None
+                        else make_default_placeholder(def_expr))
+
+    # **kwargs
+    if aa.kwarg is not None:
+        all_params.append((aa.kwarg, inspect.Parameter.VAR_KEYWORD))
+        defaults.append(inspect.Parameter.empty)
+
+    parameters = tuple(inspect.Parameter(p.arg, kind, default=default)
+                       for (p, kind), default in zip(all_params, defaults, strict=True))
+    return inspect.Signature(parameters), all_default_exprs
+
+
 def _unsupported_stmt(stmt: ast.AST, ctx: _Context) -> None:
     raise ctx.unsupported_syntax()
 
@@ -589,7 +716,7 @@ def _stmt_list(statements: Sequence[ast.stmt], ctx: _Context):
             _stmt(stmt, ctx)
 
 
-def _get_all_parameters(func_def: ast.FunctionDef, ctx: _Context) -> List[ast.arg]:
+def _get_all_parameters(func_def: ast.FunctionDef | ast.Lambda, ctx: _Context) -> List[ast.arg]:
     for a in (func_def.args.vararg, func_def.args.kwarg):
         if a is not None:
             raise ctx.syntax_error(
@@ -604,14 +731,15 @@ def _get_all_parameters(func_def: ast.FunctionDef, ctx: _Context) -> List[ast.ar
     return all_args
 
 
-def _ast2hir(func_def: ast.FunctionDef, ctx: _Context) -> hir.Block:
+def _ast2hir(func_def: ast.FunctionDef | ast.Lambda, ctx: _Context) -> hir.Block:
     with ctx.change_loc(func_def), ctx.new_block() as root_block:
         if ctx.entry_point:
+            assert isinstance(func_def, ast.FunctionDef)
             _stmt_list(func_def.body, ctx)
             # Add a Return jump to the root block if it doesn't have one
             if root_block.jump is None:
                 ctx.set_block_jump(hir.Jump.RETURN)
-        else:
+        elif isinstance(func_def, ast.FunctionDef):
             # To enable early returns in a helper function, wrap the body in a loop.
             # Thus, we can use "break" to implement the return statement.
             ctx.store("$returning", False)
@@ -624,4 +752,9 @@ def _ast2hir(func_def: ast.FunctionDef, ctx: _Context) -> hir.Block:
             ctx.call_void(hir.loop, (body_block, None))
             root_block.result = ctx.load("$retval")
             root_block.have_result = True
+        else:
+            assert isinstance(func_def, ast.Lambda)
+            root_block.result = _expr(func_def.body, ctx)
+            root_block.have_result = True
+
     return root_block

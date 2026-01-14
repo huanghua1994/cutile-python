@@ -449,7 +449,7 @@ class DebugAttrMap:
         ret = self._debug_attr_table.subprogram(
             file=file_attr,
             line=func_desc.line,
-            name=func_desc.name,
+            name="<lambda>" if func_desc.name is None else func_desc.name,
             linkage_name=self._linkage_name,
             compile_unit=compile_unit_attr,
             scope_line=func_desc.line,

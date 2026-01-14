@@ -7,9 +7,11 @@ import enum
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Set, Optional, Mapping, Any, TypeVar, Generic
+from typing import TypeVar, Generic
 
 from cuda.tile._exception import Loc, TileSyntaxError
+from cuda.tile._ir import hir
+from cuda.tile._ir.hir import ResolvedName
 from cuda.tile._ir.ir import Operation, Var, IRContext
 
 
@@ -21,82 +23,66 @@ class JumpInfo:
 
 @dataclass
 class ControlFlowInfo:
-    stored_names: tuple[str, ...]
+    stored_locals: tuple[int, ...]
     flatten: bool = False
     jumps: list[JumpInfo] = dataclasses.field(default_factory=list)
 
 
 class LocalScope:
-    def __init__(self,
-                 all_locals: Set[str],
-                 ir_ctx: IRContext,
-                 parent: Optional["LocalScope"] = None):
-        self._all_locals = all_locals
+    def __init__(self, local_names: tuple[str, ...], ir_ctx: IRContext):
+        self._local_names = local_names
         self._ir_ctx = ir_ctx
-        self._map = dict()
-        self._parent = parent
+        self._map: list[Var | None] = [None] * len(local_names)
+        self.frozen = False
+        self._dead = False
 
-    def is_local_name(self, name: str):
-        current = self
-        while current is not None:
-            if name in current._all_locals:
-                return True
-            current = current._parent
-        return False
+    @staticmethod
+    def create_frozen(local_names: tuple[str, ...],
+                      frozen_indices: tuple[int, ...],
+                      frozen_vars: tuple[Var, ...],
+                      ir_ctx: IRContext):
+        ret = LocalScope(local_names, ir_ctx)
+        for idx, var in zip(frozen_indices, frozen_vars, strict=True):
+            ret._map[idx] = var
+        ret.frozen = True
+        return ret
 
-    def redefine(self, name: str, loc: Loc) -> Var:
-        var = self._ir_ctx.make_var(name, loc)
-        self._map[name] = var
+    def mark_dead(self):
+        self._dead = True
+
+    def redefine(self, index: int, loc: Loc) -> Var:
+        assert not self._dead
+        assert not self.frozen
+        assert index >= 0
+        var = self._ir_ctx.make_var(self._local_names[index], loc)
+        self._map[index] = var
         return var
 
-    def __getitem__(self, name: str):
-        var = self._lookup(name)
+    def __getitem__(self, index: int) -> Var:
+        assert not self._dead
+        assert index >= 0
+        var = self._map[index]
         if var is None:
-            raise TileSyntaxError(f"Undefined variable {name} used")
+            raise TileSyntaxError(f"Undefined variable {self._local_names[index]} used")
         return var
 
-    def get(self, name: str, loc: Loc):
-        var = self._lookup(name)
+    def get(self, index: int, loc: Loc):
+        assert not self._dead
+        assert index >= 0
+        var = self._map[index]
         if var is None:
-            return self._ir_ctx.make_var(name, loc, undefined=True)
-        else:
-            return var
-
-    def _lookup(self, name: str) -> Optional[Var]:
-        seen = set()
-        current = self
-        while current is not None:
-            var = current._map.get(name)
-            if var is not None:
-                return var
-            # Sanity check, should not reach here.
-            if id(current) in seen:
-                raise RuntimeError("Cycle detected in Scope chain")
-            seen.add(id(current))
-            current = current._parent
-        return None
+            return self._ir_ctx.make_var(self._local_names[index], loc, undefined=True)
+        return var
 
     @contextmanager
     def enter_branch(self):
+        assert not self._dead
         old = self._map
-        self._map = _OverlayDict(old)
+        self._map = list(old)
         try:
             yield
         finally:
             self._map = old
-
-
-class _OverlayDict:
-    def __init__(self, orig_dict: dict):
-        self._orig = orig_dict
-        self._overlay = dict()
-
-    def get(self, key):
-        value = self._overlay.get(key)
-        return self._orig.get(key) if value is None else value
-
-    def __setitem__(self, key, value):
-        self._overlay[key] = value
 
 
 class _CurrentScope(threading.local):
@@ -140,14 +126,27 @@ class IntMap(Generic[V]):
             self._items.append(value)
 
 
-@dataclass
+@dataclass(eq=False)
 class Scope:
-    local: LocalScope
+    local_scopes: tuple[LocalScope, ...]
     loop_info: ControlFlowInfo | None
     if_else_info: ControlFlowInfo | None
-    frozen_globals: Mapping[str, Any]
     call_site: Loc | None
     hir2ir_varmap: IntMap[Var]
+    func_hir: hir.Function
+
+    def get_local_index(self, name: str) -> int:
+        rn: ResolvedName = self.func_hir.used_names[name]
+        assert rn.depth == len(self.local_scopes) - 1
+        return rn.index
+
+    @property
+    def local(self) -> LocalScope:
+        return self.local_scopes[-1]
+
+    @property
+    def depth(self) -> int:
+        return len(self.local_scopes) - 1
 
     @contextmanager
     def make_current(self):

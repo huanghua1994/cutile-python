@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # SPDX-License-Identifier: Apache-2.0
-
+import inspect
 import math
 from dataclasses import dataclass
 from enum import EnumMeta
@@ -17,6 +17,8 @@ from cuda.tile._exception import Loc
 if TYPE_CHECKING:
     from cuda.tile._datatype import DType
     from cuda.tile._ir.ir import Var, AggregateValue
+    from cuda.tile._ir import hir
+    from cuda.tile._ir.scope import LocalScope
 
 
 import cuda.tile._bytecode as bc
@@ -506,3 +508,73 @@ class EnumTy(Type):
 
     def __str__(self) -> str:
         return f"Enum[{self.enum_ty.__name__}]"
+
+
+# Placeholder object for use as an inspect.Parameter's default value inside
+# signatures of closures.
+@dataclass(frozen=True)
+class ClosureDefaultPlaceholder:
+    # Index into `ClosureTy.default_value_types` and `ClosureValue.default_values`.
+    default_value_index: int
+
+
+@dataclass(frozen=True)
+class LiveCapturedScope:
+    depth: int
+    local_scope: "LocalScope"
+
+
+@dataclass(frozen=True)
+class ClosureTy(Type):
+    func_hir: "hir.Function"
+    default_value_types: tuple[Type, ...]
+
+    # Lists all enclosing functions' scopes that are still live.
+    captured_scopes: tuple[LiveCapturedScope, ...]
+
+    frozen_capture_types_by_depth: tuple[tuple[Type, ...] | None]
+
+    def is_aggregate(self) -> bool:
+        return True
+
+    def aggregate_item_types(self) -> tuple["Type", ...]:
+        return (
+            *self.default_value_types,
+            *(t for types in self.frozen_capture_types_by_depth
+              if types is not None for t in types)
+        )
+
+    def make_aggregate_value(self, items: tuple["Var", ...]) -> "AggregateValue":
+        from .ir import ClosureValue
+        it = iter(items)
+        default_values = tuple(next(it) for _ in self.default_value_types)
+        frozen_captures_by_depth = tuple(None if types is None else tuple(next(it) for _ in types)
+                                         for types in self.frozen_capture_types_by_depth)
+        assert next(it, None) is None
+        return ClosureValue(default_values=default_values,
+                            frozen_captures_by_depth=frozen_captures_by_depth)
+
+    def __str__(self):
+        ret = f"Closure[{self.func_hir.desc.short_str()}"
+        if len(self.default_value_types) > 0:
+            default_strings = []
+            for p in self.func_hir.signature.parameters.values():
+                if p.default is not inspect.Parameter.empty:
+                    assert isinstance(p.default, ClosureDefaultPlaceholder)
+                    default_ty = self.default_value_types[p.default.default_value_index]
+                    default_strings.append(f"'{p.name}': {default_ty}")
+            ret += ", defaults={" + ", ".join(default_strings) + "}"
+        if any(x is not None and len(x) > 0 for x in self.frozen_capture_types_by_depth):
+            capture_strings = []
+            for types, local_indices, parent_func in zip(self.frozen_capture_types_by_depth,
+                                                         self.func_hir.captures_by_depth,
+                                                         self.func_hir.enclosing_funcs,
+                                                         strict=True):
+                if types is None:
+                    continue
+                for ty, idx in zip(types, local_indices, strict=True):
+                    name = parent_func.local_names[idx]
+                    capture_strings.append(f"'{name}': {ty}")
+            ret += ", frozen_captures={" + ", ".join(capture_strings) + "}"
+
+        return ret + "]"

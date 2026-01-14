@@ -286,6 +286,31 @@ class ListValue(AggregateValue):
         return self.base_ptr, self.length
 
 
+@dataclass
+class ClosureValue(AggregateValue):
+    # Default values of parameters. These need to be carried by the closure's value
+    # because default expressions are evaluated at definition time, not when the closure is called.
+    # Should have the same length as the corresponding `ClosureTy.default_value_types`.
+    default_values: tuple[Var, ...]
+
+    # Tuple of the same length as `ty.func_hir.enclosing_functions`
+    # and `ty.frozen_capture_types_by_depth`, where `ty` is the `ClosureTy` of this closure.
+    #
+    # For each depth `i`, `frozen_captures_by_depth[i]` is either:
+    #   - None: means the enclosing function's LocalScope is still live;
+    #   - tuple[Var, ...]: means the enclosing function's LocalScope is no longer live.
+    #       The tuple contains the final values of the variables captured from the enclosing
+    #       function's scope. Its length should be the same as `ty.func_hir.captures_by_depth`.
+    frozen_captures_by_depth: tuple[tuple[Var, ...] | None, ...]
+
+    def as_tuple(self) -> tuple["Var", ...]:
+        return (
+            *self.default_values,
+            *(v for values in self.frozen_captures_by_depth
+              if values is not None for v in values)
+        )
+
+
 def terminator(cls):
     cls._is_terminator = True
     return cls

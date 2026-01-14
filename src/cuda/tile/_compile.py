@@ -77,7 +77,8 @@ def _get_final_ir(pyfunc, args, tile_context) -> ir.Function:
     ir_ctx = ir.IRContext(tile_context)
     func_hir: hir.Function = get_function_hir(pyfunc, entry_point=True)
 
-    ir_args = _bind_kernel_arguments(func_hir.param_names, args, get_constant_annotations(pyfunc))
+    ir_args = _bind_kernel_arguments(tuple(func_hir.signature.parameters),
+                                     args, get_constant_annotations(pyfunc))
     func_body = hir2ir(func_hir, ir_args, ir_ctx)
     eliminate_assign_ops(func_body)
     dead_code_elimination_pass(func_body)
@@ -162,7 +163,7 @@ def _compiler_crash_dump(func_ir: ir.Function,
 
     artifacts = {
         f"{func_ir.name}.bytecode": bytes(bytecode_buf),
-        f"{func_ir.name}.cutileir": f"{func_ir.to_string(include_loc=False)}\n",
+        f"{func_ir.name}.cutileir": f"{func_ir.body.to_string(include_loc=False)}\n",
         "debug_info.txt": debug_info,
     }
 
@@ -184,7 +185,7 @@ def compile_tile(pyfunc,
 
     if 'CUTILEIR' in context.config.log_keys:
         code = (f"==== CuTile IR for {func_ir.name}==== \n\n"
-                f"{func_ir.to_string(include_loc=False)}\n\n")
+                f"{func_ir.body.to_string(include_loc=False)}\n\n")
         print(f'\n{code}', file=sys.stderr)
 
     sm_arch = get_sm_arch()

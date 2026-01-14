@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import dataclasses
 import linecache
+import os.path
 import re
 from dataclasses import dataclass
 from typing import Optional
@@ -11,9 +12,19 @@ from unicodedata import east_asian_width
 
 @dataclass(eq=False, frozen=True)
 class FunctionDesc:
-    name: str
+    name: str | None
     filename: str
     line: int
+
+    def __str__(self):
+        return f"'{self.name}' @{self.filename}:{self.line}"
+
+    def short_str(self):
+        if self.name is None:
+            base_name = os.path.basename(self.filename)
+            return f"<lambda at {base_name}:{self.line}>"
+        else:
+            return f"<function {self.name}>"
 
 
 @dataclass(slots=True, frozen=True)

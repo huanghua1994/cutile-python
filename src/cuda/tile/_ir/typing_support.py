@@ -3,15 +3,17 @@
 # SPDX-License-Identifier: Apache-2.0
 import inspect
 import operator
+from dataclasses import dataclass
 from enum import Enum
 from types import ModuleType, FunctionType
 from typing import Any, Callable, Mapping, Union
 from cuda.tile import _datatype as datatype
 from cuda.tile._exception import TileTypeError, TileValueError
 from cuda.tile._cext import ArraySpecialization
+from .ir import ClosureValue
 
 from .type import Type, SizeTy, TupleTy, DTypeConstructor, DTypeSpec, ListTy, NONE, StringTy, \
-    ELLIPSIS, SLICE, ModuleTy, FunctionTy, ArrayTy, EnumTy, TypeTy, LooselyTypedScalar
+    ELLIPSIS, SLICE, ModuleTy, FunctionTy, ArrayTy, EnumTy, TypeTy, LooselyTypedScalar, ClosureTy
 
 # Store mapping from 3rd party dtype objects
 # e.g. np.float32 -> float32, torch.bfloat16 -> bfloat16
@@ -116,7 +118,16 @@ BUILTIN_FUNCS = {
 }
 
 
-def get_signature(f):
+@dataclass(frozen=True, eq=False)
+class Closure:
+    ty: ClosureTy
+    val: ClosureValue
+
+
+def get_signature(f) -> inspect.Signature:
+    if isinstance(f, Closure):
+        return f.ty.func_hir.signature
+
     if stub := BUILTIN_FUNCS.get(f):
         f = stub
     elif f in dtype_registry:
