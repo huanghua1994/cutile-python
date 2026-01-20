@@ -4,7 +4,7 @@
 
 
 from cuda.tile._ir.ir import Block, Var
-from cuda.tile._ir.ops import Loop, IfElse, Continue, Break, EndBranch, Return
+from cuda.tile._ir.ops import Loop, IfElse, Continue, Break, EndBranch, Return, TileReduce
 
 from dataclasses import dataclass
 import enum
@@ -81,7 +81,7 @@ def _hoist(block: Block, stack: list[_StackItem], def_depth: dict[str, int], is_
         # We can only hoist operations out of loops, not other nested blocks like IfElse branches.
         depinfo = _DependencyInfo(must_stay=not is_loop_body)
 
-        if isinstance(op, Loop):
+        if isinstance(op, Loop | TileReduce):
             for var in op.body.params:
                 def_depth[var.name] = depth + 1
 
@@ -91,7 +91,8 @@ def _hoist(block: Block, stack: list[_StackItem], def_depth: dict[str, int], is_
                 ret.mobility = _BlockMobility.IMMOVABLE
                 depinfo.must_stay = True
 
-            for v in op.initial_values:
+            inputs = op.initial_values if isinstance(op, Loop) else op.xs
+            for v in inputs:
                 depinfo.update(_get_def_depth(def_depth, v), depth)
             depinfo.update(body_res.min_depth, depth)
         elif isinstance(op, IfElse):

@@ -527,9 +527,9 @@ class Operation:
         self,
         op: str,
         operands: dict[str, Optional[Var | Tuple[Var, ...]]],
-        result_vars: List[Var],
+        result_vars: Sequence[Var],
         attributes: Optional[Dict[str, Any]] = None,
-        nested_blocks: Optional[List[Block]] = None,
+        nested_blocks: Optional[Sequence[Block]] = None,
         loc: Loc = Loc.unknown(),
     ):
         self.op = op

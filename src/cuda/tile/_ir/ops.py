@@ -6,7 +6,7 @@ import math
 import operator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Sequence, Tuple, Optional, Union, Any, List, Callable, Iterator
+from typing import Sequence, Tuple, Optional, Union, Any, List, Callable, Iterator, Iterable
 
 from typing_extensions import override
 
@@ -61,9 +61,7 @@ from cuda.tile._datatype import (
     DType, is_integral, is_float, is_signed, is_boolean, is_restricted_float,
 )
 from cuda.tile._ir2bytecode import (
-    lower_reduce,
-    lower_reduce_argmax_argmin, lower_scan,
-    BytecodeContext, typeid,
+    lower_scan, BytecodeContext, typeid,
     generate_bytecode_for_block, convert_dtype, get_list_item_repr_size_in_words,
     get_list_partition_view_tile_size, tensor_view_typeid, tensor_view_typeid_for_list
 )
@@ -2894,40 +2892,153 @@ def matmul(x: Var, y: Var) -> Var:
 
 
 class TileReduce(TypedOperation):
-    def __init__(self, fn: str, x: Var, axis: int,
-                 rounding_mode: Optional[RoundingMode], flush_to_zero: bool,
-                 result_var: Var, loc: Loc):
+    def __init__(self, xs: tuple[Var, ...], identities: tuple[bool | int | float, ...], axis: int,
+                 body: Block, result_vars: tuple[Var, ...], loc: Loc):
         super().__init__(
             "tile_reduce",
-            operands={"x": x},
-            attributes={
-                "fn": fn, "axis": axis,
-                "rounding_mode": rounding_mode,
-                "flush_to_zero": flush_to_zero,
-            },
-            result_vars=[result_var],
+            operands={"xs": xs},
+            attributes={"identities": identities, "axis": axis},
+            nested_blocks=[body],
+            result_vars=result_vars,
             loc=loc,
         )
 
+    @property
+    def body(self):
+        return self.nested_blocks[0]
+
     @override
-    def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
-        x_type = ctx.typeof(self.x)
-        x_value = ctx.get_value(self.x)
-        res_type = ctx.typeof(self.result_var)
-        return lower_reduce(
-            ctx, x_value, x_type, self.axis, res_type, self.fn,
-            self.rounding_mode, self.flush_to_zero
+    def _to_string_block_prefixes(self) -> List[str]:
+        return ["do"]
+
+    @override
+    def generate_bytecode(self, ctx: BytecodeContext) -> tuple[bc.Value, ...]:
+        xs = tuple(ctx.get_value(x) for x in self.xs)
+        res_typeids = tuple(ctx.typeid_of(v) for v in self.result_vars)
+
+        identities = []
+        param_type_ids = []
+        for id_val, x in zip(self.identities, self.xs, strict=True):
+            x_dtype = get_dtype(x.get_type())
+            x_dtype_id = typeid(ctx.type_table, x_dtype, wrap_scalars=False)
+            if datatype.is_float(x_dtype):
+                x_dtype_bc = x_dtype._bytecode_type
+                attr = bc.Float(float(id_val), x_dtype_bc, ctx.type_table)
+            elif datatype.is_boolean(x_dtype):
+                attr = bc.Bool(bool(id_val))
+            else:
+                assert datatype.is_integral(x_dtype)
+                attr = bc.Integer(x_dtype_id, x_dtype.bitwidth, int(id_val))
+            identities.append(attr)
+
+            x_tile_typeid = ctx.type_table.tile(x_dtype_id, ())
+            param_type_ids.append(x_tile_typeid)
+            param_type_ids.append(x_tile_typeid)
+
+        nested_builder = bc.encode_ReduceOp(
+            ctx.builder,
+            result_types=res_typeids,
+            operands=xs,
+            dim=self.axis,
+            identities=identities
         )
+
+        with nested_builder.new_block(param_type_ids) as block_args:
+            for var, value in zip(self.body.params, block_args, strict=True):
+                ctx.set_value(var, value)
+            generate_bytecode_for_block(ctx, self.body)
+
+        return nested_builder.done()
+
+
+def raw_reduce(xs: tuple[Var, ...], identities: tuple[bool | int | float], axis: int,
+               body: Callable[[tuple[Var, ...], tuple[Var, ...]], tuple[Var, ...]]
+               ) -> tuple[Var, ...]:
+    builder = Builder.get_current()
+
+    block_params = []
+    lhs_vars = []
+    rhs_vars = []
+    input_shape = ()
+    for i, x in enumerate(xs):
+        x_ty = x.get_type()
+        assert isinstance(x_ty, TileTy)
+        if i == 0:
+            input_shape = x_ty.shape_value
+        else:
+            assert input_shape == x_ty.shape_value
+        tile_0d_ty = make_tile_ty(x_ty.dtype, ())
+        for _ in range(2):
+            var = builder.ir_ctx.make_temp(builder.loc)
+            var.set_type(tile_0d_ty)
+            block_params.append(var)
+        lhs_vars.append(block_params[-2])
+        rhs_vars.append(block_params[-1])
+
+    assert 0 <= axis < len(input_shape)
+    result_shape = input_shape[:axis] + input_shape[axis+1:]
+    result_types = tuple(make_tile_ty(x.get_type().dtype, result_shape) for x in xs)
+
+    assert len(xs) == len(identities)
+
+    with nested_block(builder.loc) as body_block:
+        body_block.params = tuple(block_params)
+        body_results = body(tuple(lhs_vars), tuple(rhs_vars))
+        for body_res, x in zip(body_results, xs, strict=True):
+            body_res_ty = body_res.get_type()
+            assert isinstance(body_res_ty, TileTy)
+            assert body_res_ty.shape_value == ()
+            assert body_res_ty.dtype == x.get_type().dtype
+
+        add_operation(EndBranch, (), outputs=body_results)
+
+    return add_operation(TileReduce, result_types, xs=xs, identities=identities, axis=axis,
+                         body=body_block)
+
+
+def reduce(xs: tuple[Var, ...], identities: tuple[bool | int | float, ...],
+           axis: int | None | Iterable[int], keepdims: bool,
+           body: Callable[[tuple[Var, ...], tuple[Var, ...]], tuple[Var, ...]]
+           ) -> tuple[Var, ...]:
+    if len(xs) == 0:
+        raise TileTypeError("Need at least one input value to reduce")
+
+    if len(xs) != len(identities):
+        raise TileTypeError(f"Number of input values ({len(xs)}) doesn't match the"
+                            f" number of identities ({len(identities)})")
+
+    common_input_shape = ()
+
+    x_types = tuple(require_tile_type(x) for x in xs)
+    for x_ty in x_types:
+        try:
+            common_input_shape = broadcast_shapes2(common_input_shape, x_ty.shape_value)
+        except BroadcastError:
+            all_shapes = ", ".join(str(ty.shape_value) for ty in x_types)
+            raise TileTypeError(f"Input shapes {all_shapes}"
+                                f" are not broadcastable to a common shape")
+
+    if axis is None:
+        axis = tuple(range(len(common_input_shape)))
+    else:
+        if isinstance(axis, int):
+            axis = (axis,)
+        axis = sorted(normalize_axis(a, len(common_input_shape)) for a in axis)
+        for a1, a2 in zip(axis, axis[1:]):
+            if a1 == a2:
+                raise TileTypeError(f"Repeated reduction axis {a1}")
+
+    xs = tuple(broadcast_to(x, common_input_shape) for x in xs)
+    for i, a in enumerate(axis):
+        xs = raw_reduce(xs, identities, a - i, body)
+
+    result_shape = _get_reduction_shape(common_input_shape, axis, keepdims)
+    return tuple(reshape(x, result_shape) for x in xs)
 
 
 def _get_reduction_shape(shape: Tuple[int, ...],
-                         normalized_axis: int | Tuple[int, ...] | None,
+                         normalized_axis: Tuple[int, ...],
                          keepdims: bool) -> Tuple[int, ...]:
-    if normalized_axis is None:
-        normalized_axis = tuple(range(len(shape)))
-    if isinstance(normalized_axis, int):
-        normalized_axis = (normalized_axis,)
-    normalized_axis = set(normalized_axis)
     ret = []
     for i, size in enumerate(shape):
         if i in normalized_axis:
@@ -2938,29 +3049,46 @@ def _get_reduction_shape(shape: Tuple[int, ...],
     return tuple(ret)
 
 
-def reduce(fn: str, x: Var, axis: Optional[tuple[int, ...]], keepdims: bool,
-           rounding_mode: Optional[RoundingMode] = None,
-           flush_to_zero: bool = False) -> Var:
+def reduce_simple(fn: str, x: Var, axis: int | None | tuple[int, ...], keepdims: bool,
+                  rounding_mode: Optional[RoundingMode] = None,
+                  flush_to_zero: bool = False) -> Var:
     x_type = require_tile_type(x)
     check_rd_and_ftz(fn, rounding_mode, flush_to_zero, x_type.dtype)
-    x_shape = x_type.shape
-    rank = len(x_shape)
-    if axis is None:
-        axis = tuple(range(rank))
-    else:
-        axis = tuple([normalize_axis(axis_value, rank) for axis_value in axis])
 
-    x_dtype = datatype.default_int_type if datatype.is_boolean(x_type.dtype) else x_type.dtype
-    x = _promote_and_broadcast_to(x, TileTy(x_dtype, x_shape))
-    for i, axis_value in enumerate(axis):
-        axis_value -= i
-        x_shape = x_shape[:axis_value] + x_shape[axis_value + 1:]
-        x = add_operation(
-            TileReduce, TileTy(x_dtype, TupleTy(x_shape)),
-            fn=fn, x=x, axis=axis_value,
-            rounding_mode=rounding_mode, flush_to_zero=flush_to_zero
-        )
-    return reshape(x, _get_reduction_shape(x_type.shape_value, axis, keepdims))
+    if datatype.is_boolean(x_type.dtype):
+        x = astype(x, datatype.default_int_type)
+
+    match fn:
+        case "add": id_val = 0
+        case "mul": id_val = 1
+        case "min": id_val = _get_min_max(x_type.dtype)[1]
+        case "max": id_val = _get_min_max(x_type.dtype)[0]
+        case _: assert False
+
+    def body(lhs: tuple[Var], rhs: tuple[Var]) -> tuple[Var]:
+        [lhs], [rhs] = lhs, rhs
+        ret = raw_binary_arithmetic(fn, lhs, rhs,
+                                    rounding_mode=rounding_mode, flush_to_zero=flush_to_zero)
+        return (ret,)
+
+    [ret] = reduce((x,), (id_val,), axis, keepdims, body)
+    return ret
+
+
+Limits = Tuple[float, float] | Tuple[int, int]
+
+
+def _get_min_max(dtype: datatype.DType) -> Limits:
+    use_float = datatype.is_float(dtype)
+    if use_float:
+        if dtype in [datatype.float16, datatype.bfloat16, datatype.float32, datatype.float64]:
+            return -float("inf"), float("inf")
+        else:
+            raise NotImplementedError(f"Unsupported float dtype: {dtype}")
+    elif datatype.is_signed(dtype):
+        return -(1 << (dtype.bitwidth-1)), (1 << (dtype.bitwidth-1)) - 1
+    else:
+        return 0, (1 << dtype.bitwidth) - 1
 
 
 def _parse_reduce_axis(axis: Var) -> Optional[tuple[int, ...]]:
@@ -2981,7 +3109,8 @@ def reduce_impl_with_rd_and_ftz(fn: str, x: Var, axis: Var, keepdims: Var, round
     keepdims = require_constant_bool(keepdims)
     rounding_mode = require_optional_constant_enum(rounding_mode, RoundingMode)
     flush_to_zero = require_constant_bool(flush_to_zero)
-    return reduce(fn, x, axis, keepdims, rounding_mode=rounding_mode, flush_to_zero=flush_to_zero)
+    return reduce_simple(fn, x, axis, keepdims,
+                         rounding_mode=rounding_mode, flush_to_zero=flush_to_zero)
 
 
 @impl(ct.max, fixed_args=["max"])
@@ -2990,53 +3119,63 @@ def reduce_impl_with_ftz(fn: str, x: Var, axis: Var, keepdims: Var, flush_to_zer
     axis = _parse_reduce_axis(axis)
     keepdims = require_constant_bool(keepdims)
     flush_to_zero = require_constant_bool(flush_to_zero)
-    return reduce(fn, x, axis, keepdims, flush_to_zero=flush_to_zero)
+    return reduce_simple(fn, x, axis, keepdims, flush_to_zero=flush_to_zero)
 
 
-class TileArgReduce(TypedOperation):
-    def __init__(self, fn: str, x: Var, axis: Optional[int],
-                 result_var: Var, loc: Loc):
-        super().__init__(
-            "tile_arg_reduce",
-            operands={"x": x},
-            attributes={"fn": fn, "axis": axis},
-            result_vars=[result_var],
-            loc=loc,
-        )
+def argmax_argmin(fn: str, x: Var, axis: Optional[int], keepdims: bool) -> Var:
+    require_tile_type(x)
+    final_shape = None
+    if axis is None:
+        if keepdims:
+            final_shape = (1,) * x.get_type().ndim
+            keepdims = False
+        x = reshape(x, (-1,))
+        axis = 0
+    else:
+        axis = normalize_axis(axis, x.get_type().ndim)
 
-    @override
-    def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
-        x_type = ctx.typeof(self.x)
-        x_value = ctx.get_value(self.x)
-        res_type = ctx.typeof(self.result_var)
-        return lower_reduce_argmax_argmin(
-            ctx, x_value, x_type, self.axis, res_type, self.fn
-        )
+    if datatype.is_boolean(x.get_type().dtype):
+        x = astype(x, datatype.default_int_type)
 
+    x_type = x.get_type()
+    indices = arange(x_type.shape_value[axis], datatype.default_int_type)
+    indices = reshape(indices, tuple(-1 if i == axis else 1 for i in range(x_type.ndim)))
 
-def argreduce(fn: str, x: Var, axis: Optional[int], keepdims: bool) -> Var:
-    x_type = require_tile_type(x)
-    x_shape = x_type.shape
-    if axis is not None:
-        axis = normalize_axis(axis, len(x_shape))
+    match fn:
+        case "argmin":
+            id_val = _get_min_max(x_type.dtype)[1]
+            cmp = "lt"
+        case "argmax":
+            id_val = _get_min_max(x_type.dtype)[0]
+            cmp = "gt"
+        case _: assert False
 
-    x_dtype = datatype.default_int_type if datatype.is_boolean(x_type.dtype) else x_type.dtype
-    x = _promote_and_broadcast_to(x, TileTy(x_dtype, x_shape))
-    output_dtype = datatype.default_int_type
-    output_shape = TupleTy([]) if axis is None else TupleTy(x_shape[:axis] + x_shape[axis + 1:])
-    x = add_operation(
-        TileArgReduce, TileTy(output_dtype, output_shape),
-        fn=fn, x=x, axis=axis
-    )
-    return reshape(x, _get_reduction_shape(x_type.shape_value, axis, keepdims))
+    def body(lhs: tuple[Var, Var], rhs: tuple[Var, Var]) -> tuple[Var, Var]:
+        lhs_val, lhs_idx = lhs
+        rhs_val, rhs_idx = rhs
+        val_strict = raw_comparison(cmp, lhs_val, rhs_val)
+        val_equal = raw_comparison("eq", lhs_val, rhs_val)
+        index_lt = raw_comparison("lt", lhs_idx, rhs_idx)
+        val_equal_and_index_lt = raw_binary_bitwise("and_", val_equal, index_lt)
+        cond = raw_binary_bitwise("or_", val_strict, val_equal_and_index_lt)
+        res = raw_where(cond, lhs_val, rhs_val)
+        idx = raw_where(cond, lhs_idx, rhs_idx)
+        return res, idx
+
+    [_, ret] = reduce((x, indices), (id_val, 0), axis, keepdims, body)
+
+    if final_shape is not None:
+        ret = reshape(ret, final_shape)
+
+    return ret
 
 
 @impl(ct.argmax, fixed_args=["argmax"])
 @impl(ct.argmin, fixed_args=["argmin"])
-def argreduce_impl(fn: str, x: Var, axis: Var, keepdims: Var) -> Var:
+def argmax_argmin_impl(fn: str, x: Var, axis: Var, keepdims: Var) -> Var:
     axis = require_optional_constant_int(axis)
     keepdims = require_constant_bool(keepdims)
-    return argreduce(fn, x, axis, keepdims)
+    return argmax_argmin(fn, x, axis, keepdims)
 
 
 class TileScan(TypedOperation):

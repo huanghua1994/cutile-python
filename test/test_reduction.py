@@ -140,16 +140,18 @@ def test_reduce_maxminf_all_axes(shape, dtype, keepdims, reduce_op, torch_op):
     torch.testing.assert_close(y, ref_result)
 
 
-def make_reduce_max_axis12(reduce_op):
+def make_reduce_max_two_axes(reduce_op):
     @ct.kernel
     def kernel(input, output,
                TILE: ct.Constant[int],
                N: ct.Constant[int],
                M: ct.Constant[int],
-               keepdims: ct.Constant[bool]):
+               keepdims: ct.Constant[bool],
+               a1: ct.Constant[int],
+               a2: ct.Constant[int]):
         px = ct.bid(0)
         rows = ct.load(input, index=(px, 0, 0), shape=(TILE, N, M))
-        out = reduce_op(rows, axis=(1, 2), keepdims=keepdims)
+        out = reduce_op(rows, axis=(a1, a2), keepdims=keepdims)
         if keepdims:
             ct.store(output, index=(px, 0, 0), tile=out)
         else:
@@ -162,14 +164,27 @@ def make_reduce_max_axis12(reduce_op):
 @pytest.mark.parametrize("dtype", float_dtypes, ids=dtype_id)
 @pytest.mark.parametrize("keepdims", [True, False])
 @pytest.mark.parametrize("reduce_op, torch_op", maxmin_cases)
-def test_reduce_maxminf_axis12(shape, tile, dtype, keepdims, reduce_op, torch_op):
+@pytest.mark.parametrize("axes", [(1, 2), (2, 1), (-1, -2), (-2, -1), (-2, 2), (2, -2)])
+def test_reduce_maxminf_two_axes(shape, tile, dtype, keepdims, reduce_op, torch_op, axes):
     x = torch.rand(shape, dtype=dtype, device="cuda") * 2 - 1
     y = _squeezed_zeros_like(x, axis=(1, 2), keepdims=keepdims)
     grid = (ceil(shape[0] / tile), 1, 1)
-    kernel = make_reduce_max_axis12(reduce_op)
-    ct.launch(torch.cuda.current_stream(), grid, kernel, (x, y, tile, shape[1], shape[2], keepdims))
+    kernel = make_reduce_max_two_axes(reduce_op)
+    ct.launch(torch.cuda.current_stream(), grid, kernel,
+              (x, y, tile, shape[1], shape[2], keepdims, *axes))
     ref_result = torch_op(x, dim=(1, 2), keepdim=keepdims)
     torch.testing.assert_close(y, ref_result)
+
+
+def test_reduce_repeated_axis_error():
+    @ct.kernel
+    def kernel(x):
+        tx = ct.load(x, (0, 0), (16, 16))
+        ct.sum(tx, axis=(1, 1))
+
+    x = torch.rand((16, 16), dtype=torch.float32, device="cuda")
+    with pytest.raises(TileTypeError, match="Repeated reduction axis 1"):
+        ct.launch(torch.cuda.current_stream(), (1,), kernel, (x,))
 
 
 sumprod_cases = [

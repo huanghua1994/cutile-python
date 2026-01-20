@@ -283,7 +283,7 @@ class TileTy(Type):
         return f"Tile[{self.dtype},{shape_str}]"
 
 
-def make_tile_ty(dtype, shape: Sequence[int]):
+def make_tile_ty(dtype, shape: Sequence[int]) -> TileTy:
     shape = TupleTy(tuple(SizeTy(x) for x in shape))
     return TileTy(dtype, shape)
 
